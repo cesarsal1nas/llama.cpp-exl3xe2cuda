@@ -83,7 +83,7 @@ HTTP generate TG (f16 vs q4 KV). Same 26k/256 cell. B65 v3 is the quality pack o
 
 ![HTTP generate TG](docs/card-http-tg.svg)
 
-llama-cli greedy NIGHTWIRE HTML (not HTTP), ctx 8192, EOS:
+llama-cli greedy Test HTML (not HTTP), ctx 8192, EOS:
 
 ```
 4090 CUDA0 v3            Prompt 774.2  Generation 57.5 t/s
