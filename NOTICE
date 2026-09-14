@@ -1,0 +1,10 @@
+llama.cpp-exl3xe2cuda is a fork of llama.cpp (MIT, The ggml authors)
+https://github.com/ggml-org/llama.cpp
+
+EXL3 CUDA kernels in ggml/src/ggml-cuda/exl3/ are derived from ExLlamaV3
+(MIT, Copyright 2025 Turboderp)
+https://github.com/turboderp-org/exllamav3
+
+See LICENSE and licenses/LICENSE-exllamav3.
+
+Not affiliated with ggml-org or Turboderp.

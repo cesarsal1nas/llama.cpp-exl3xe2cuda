@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="276" viewBox="0 0 1040 276">
+<rect width="100%" height="100%" fill="#0d1117"/>
+<text x="16" y="258" fill="#8b949e" font-size="11" font-family="-apple-system,Segoe UI,sans-serif">llama-server HTTP TG t/s · 26k prompt / 256 out · ctx 32768 · f16 vs q4 KV</text>
+<rect x="900" y="248" width="10" height="10" fill="#3fb950" rx="2"/>
+<text x="916" y="257" fill="#8b949e" font-size="11">f16</text>
+<rect x="950" y="248" width="10" height="10" fill="#58a6ff" rx="2"/>
+<text x="966" y="257" fill="#8b949e" font-size="11">q4</text>
+<rect x="16" y="8" width="320" height="220" rx="8" fill="#161b22" stroke="#30363d"/>
+<text x="32" y="32" fill="#e6edf3" font-size="15" font-family="-apple-system,Segoe UI,sans-serif" font-weight="600">4090 v3</text>
+<line x1="60" y1="180.0" x2="320" y2="180.0" stroke="#30363d" stroke-width="1"/>
+<text x="24" y="184.0" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">0 t/s</text>
+<line x1="60" y1="114.0" x2="320" y2="114.0" stroke="#30363d" stroke-width="1"/>
+<text x="24" y="118.0" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">50 t/s</text>
+<line x1="60" y1="48.0" x2="320" y2="48.0" stroke="#30363d" stroke-width="1"/>
+<text x="24" y="52.0" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">100 t/s</text>
+<rect x="71.7" y="111.4" width="20.8" height="68.6" fill="#3fb950" rx="2"/>
+<rect x="94.5" y="110.0" width="20.8" height="70.0" fill="#58a6ff" rx="2"/>
+<rect x="136.7" y="89.7" width="20.8" height="90.3" fill="#3fb950" rx="2"/>
+<rect x="159.5" y="93.0" width="20.8" height="87.0" fill="#58a6ff" rx="2"/>
+<rect x="201.7" y="94.6" width="20.8" height="85.4" fill="#3fb950" rx="2"/>
+<rect x="224.5" y="101.2" width="20.8" height="78.8" fill="#58a6ff" rx="2"/>
+<rect x="266.7" y="83.8" width="20.8" height="96.2" fill="#3fb950" rx="2"/>
+<rect x="289.5" y="90.2" width="20.8" height="89.8" fill="#58a6ff" rx="2"/>
+<text x="287.5" y="196.0" fill="#8b949e" font-size="11" font-family="-apple-system,Segoe UI,sans-serif" text-anchor="middle">cheap</text>
+<rect x="360" y="8" width="320" height="220" rx="8" fill="#161b22" stroke="#30363d"/>
+<text x="376" y="32" fill="#e6edf3" font-size="15" font-family="-apple-system,Segoe UI,sans-serif" font-weight="600">B65 v3</text>
+<line x1="404" y1="180.0" x2="664" y2="180.0" stroke="#30363d" stroke-width="1"/>
+<text x="368" y="184.0" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">0 t/s</text>
+<line x1="404" y1="114.0" x2="664" y2="114.0" stroke="#30363d" stroke-width="1"/>
+<text x="368" y="118.0" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">20 t/s</text>
+<line x1="404" y1="48.0" x2="664" y2="48.0" stroke="#30363d" stroke-width="1"/>
+<text x="368" y="52.0" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">40 t/s</text>
+<rect x="415.7" y="151.5" width="20.8" height="28.5" fill="#3fb950" rx="2"/>
+<rect x="438.5" y="146.0" width="20.8" height="34.0" fill="#58a6ff" rx="2"/>
+<rect x="480.7" y="134.5" width="20.8" height="45.5" fill="#3fb950" rx="2"/>
+<rect x="503.5" y="129.5" width="20.8" height="50.5" fill="#58a6ff" rx="2"/>
+<rect x="545.7" y="145.3" width="20.8" height="34.6" fill="#3fb950" rx="2"/>
+<rect x="568.5" y="143.4" width="20.8" height="36.6" fill="#58a6ff" rx="2"/>
+<rect x="610.7" y="133.5" width="20.8" height="46.5" fill="#3fb950" rx="2"/>
+<rect x="633.5" y="129.2" width="20.8" height="50.8" fill="#58a6ff" rx="2"/>
+<text x="631.5" y="196.0" fill="#8b949e" font-size="11" font-family="-apple-system,Segoe UI,sans-serif" text-anchor="middle">cheap</text>
+<rect x="704" y="8" width="320" height="220" rx="8" fill="#161b22" stroke="#30363d"/>
+<text x="720" y="32" fill="#e6edf3" font-size="15" font-family="-apple-system,Segoe UI,sans-serif" font-weight="600">B65 xe2-16</text>
+<line x1="748" y1="180.0" x2="1008" y2="180.0" stroke="#30363d" stroke-width="1"/>
+<text x="712" y="184.0" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">0 t/s</text>
+<line x1="748" y1="114.0" x2="1008" y2="114.0" stroke="#30363d" stroke-width="1"/>
+<text x="712" y="118.0" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">20 t/s</text>
+<line x1="748" y1="48.0" x2="1008" y2="48.0" stroke="#30363d" stroke-width="1"/>
+<text x="712" y="52.0" fill="#8b949e" font-size="10" font-family="ui-monospace,monospace">40 t/s</text>
+<rect x="759.7" y="134.8" width="20.8" height="45.2" fill="#3fb950" rx="2"/>
+<rect x="782.5" y="121.1" width="20.8" height="58.9" fill="#58a6ff" rx="2"/>
+<rect x="824.7" y="104.1" width="20.8" height="75.9" fill="#3fb950" rx="2"/>
+<rect x="847.5" y="84.0" width="20.8" height="96.0" fill="#58a6ff" rx="2"/>
+<rect x="889.7" y="104.4" width="20.8" height="75.6" fill="#3fb950" rx="2"/>
+<rect x="912.5" y="92.5" width="20.8" height="87.5" fill="#58a6ff" rx="2"/>
+<rect x="954.7" y="102.5" width="20.8" height="77.5" fill="#3fb950" rx="2"/>
+<rect x="977.5" y="78.7" width="20.8" height="101.3" fill="#58a6ff" rx="2"/>
+<text x="975.5" y="196.0" fill="#8b949e" font-size="11" font-family="-apple-system,Segoe UI,sans-serif" text-anchor="middle">cheap</text>
+</svg>
