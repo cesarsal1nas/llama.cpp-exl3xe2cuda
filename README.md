@@ -59,8 +59,8 @@ v3 is the quality default. xe2-16 is B65-only (CUDA aborts).
 
 ## Card
 
-Four blocks. Different cells. Do not read a row from one block as the other.
-llama-server HTTP only. llama-bench is not the card.
+Different files and test settings, keep the rows separate. The card uses
+llama-server HTTP, not llama-bench.
 
 Stock Q/IQ is a normal GGUF. On a Battlemage dGPU this fork adds Xe2 extras
 (IQ4/Q4 ESIMD GEMV, FA ESIMD, GDN COL2 when n_tokens>=16, fused GDN gate and
@@ -72,6 +72,9 @@ XE2MX4 is a separate quant. One block is 32 weights, 4-bit integer nibbles
 S48R is a fused rotation on that same block, not a wider group. Not EXL3.
 CUDA does not load it. This tree includes the SYCL loader and quantizer.
 The current card file is unrotated Orca Cyber XE2MX4, not S48R.
+
+GGUF: https://huggingface.co/cesarsal1nas/Orca-Cyber-27B-XE2MX4-GGUF
+File: `OrcaSAQ-2-27B-Uncensored-XE2MX4.gguf`.
 
 EXL3 v3 is the quality pack. It loads on CUDA and Xe2 SYCL. Wiki PPL 6.42.
 EXL3 xe2-16 is the same weights on a K-column walk. One trellis cannot feed
@@ -96,14 +99,13 @@ Orca Cyber XE2MX4 unrotated  6.9621
 Orca Cyber XE2MX4 S48R       7.1969
 ```
 
-S48R was the rotated variant previously used in local testing, not a previous
-public release of this fork. We switched to unrotated XE2MX4 because it measured
-better held-out PPL at similar speed: 6.96 vs 7.20, with the IQ4_XS source at 6.81.
+S48R is what we used locally before this update, it was not a previous public
+release. We switched to unrotated XE2MX4 because PPL was better at similar
+speed, 6.96 vs 7.20, with the IQ4_XS source at 6.81.
 
-This is requantization from IQ4_XS, not a BF16 comparison. These PPL values are
-prior measurements on the same test protocol, not a new PPL run on this release
-binary. PPL and the reading test are quality checks, not proof of equal quality
-on every task.
+This was requantized from IQ4_XS, not BF16, so there is another quantization
+step. PPL is from the earlier runs on the same test text, not a fresh run on
+this release binary, and it does not tell you how every task will go.
 
 Historical S48R comparison follows. It is a different file and is not the
 unrotated release card. The stock IQ4 rows are historical too.
@@ -350,11 +352,10 @@ pulls the total down, which is why the rows above force the length.
 
 ### Runtime memory
 
-File size is not runtime VRAM. XE2MX4 stores 32 weights and an FP16 scale per
-block (4.5 bits per weight). Runtime memory also includes KV cache, recurrent
-state, compute buffers and kernel-specific weight packs. XE2MX4 does not always
-use more VRAM than another quant; compare the same model, context, slot count
-and pack policy.
+The file is not the whole VRAM footprint, XE2MX4 stores 32 weights and an
+FP16 scale per block (4.5 bpw), then runtime adds KV cache, recurrent state,
+compute buffers and weight packs. It does not always use more VRAM than
+another quant, compare the same model, context, slots and pack settings.
 
 The model weights remain GPU-resident for decoding. With host-pack enabled,
 an additional packed representation of attention/projection weights lives in
@@ -363,15 +364,15 @@ decode. In the earlier Orca cell that pack was about 3.4 GiB. This saves residen
 VRAM but uses host RAM and adds transfer overhead, especially on short prompts.
 It is not CPU expert offload and does not mean the whole model runs from RAM.
 
-Idle and peak VRAM are different. Prefill needs temporary packs and working
-buffers; more slots add KV cache and recurrent state. Peak-minus-idle is not
-just the host pack. The concurrent tables report both.
+Prefill needs temporary packs and working buffers, more slots add KV cache
+and recurrent state, so peak minus idle is not just the host pack. Both
+numbers are in the concurrent tables.
 
 ### Reading the card
 
-Each table names its file and protocol. A configured 262k context is not the
-same as a successful 250k reading test. Historical S48R rows do not establish
-long-context quality for the unrotated release file.
+Each table names the file and settings, loading a 262k context is not the
+same as reading 250k correctly, and the older S48R rows are not results for
+the unrotated file.
 
 Fixed-length concurrency tests measure simultaneous inference, not autonomous
 agent performance. The repeated prompt favors speculative decoding and does
