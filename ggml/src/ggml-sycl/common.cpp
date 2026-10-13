@@ -11,6 +11,9 @@
 //
 
 #include "common.hpp"
+#include <atomic>
+#include <string>
+#include <unordered_map>
 #include <sycl/backend.hpp>
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
 #include <level_zero/ze_api.h>
@@ -59,7 +62,7 @@ bool gpu_has_xmx(sycl::device &dev) {
     return dev.has(sycl::aspect::ext_intel_matrix);
 }
 
-int ggml_sycl_get_env(const char *env_name, int default_val) {
+static int ggml_sycl_get_env_raw(const char *env_name, int default_val) {
     char *user_device_string = getenv(env_name);
     int user_number = default_val;
 
@@ -71,6 +74,44 @@ int ggml_sycl_get_env(const char *env_name, int default_val) {
         user_number = default_val;
     }
     return user_number;
+}
+
+// getenv() scans the whole environment and the graph loop reads dozens of knobs per node (~500 per decode step).
+// Once compute starts, values are memoized per thread. Keys are the caller's pointer, checked against the stored
+// name and default; any in-process setenv (xe2mx LO contract) bumps the epoch. GGML_SYCL_ENV_CACHE=0 disables it.
+static std::atomic<bool>     g_sycl_env_cache_on{false};
+static std::atomic<uint32_t> g_sycl_env_epoch{1};
+
+void ggml_sycl_env_cache_enable() {
+    static const bool allowed = ggml_sycl_get_env_raw("GGML_SYCL_ENV_CACHE", 1) != 0;
+    if (allowed) {
+        g_sycl_env_cache_on.store(true, std::memory_order_relaxed);
+    }
+}
+
+void ggml_sycl_env_cache_invalidate() {
+    g_sycl_env_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+int ggml_sycl_get_env(const char *env_name, int default_val) {
+    if (!g_sycl_env_cache_on.load(std::memory_order_relaxed)) {
+        return ggml_sycl_get_env_raw(env_name, default_val);
+    }
+    struct env_ent {
+        std::string name;
+        int         def;
+        int         val;
+        uint32_t    epoch;
+    };
+    thread_local std::unordered_map<const char *, env_ent> cache;
+    const uint32_t ep = g_sycl_env_epoch.load(std::memory_order_relaxed);
+    auto it = cache.find(env_name);
+    if (it != cache.end() && it->second.epoch == ep && it->second.def == default_val && it->second.name == env_name) {
+        return it->second.val;
+    }
+    const int v = ggml_sycl_get_env_raw(env_name, default_val);
+    cache[env_name] = env_ent{ env_name, default_val, v, ep };
+    return v;
 }
 
 int64_t downsample_sycl_global_range(int64_t accumulate_block_num, int64_t block_size) {

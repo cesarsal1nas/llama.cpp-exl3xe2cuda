@@ -87,6 +87,10 @@ void ggml_sycl_relu(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 void ggml_sycl_sigmoid(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
+void ggml_sycl_unary_from(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const ggml_tensor * src);
+void ggml_sycl_unary_mul_from(ggml_backend_sycl_context & ctx, ggml_tensor * unary, const ggml_tensor * src,
+                              ggml_tensor * mul);
+
 void ggml_sycl_hardsigmoid(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 void ggml_sycl_hardswish(ggml_backend_sycl_context & ctx, ggml_tensor * dst);

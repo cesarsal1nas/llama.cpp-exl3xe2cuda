@@ -31,6 +31,35 @@ file(GLOB   SRCS "template-instances/fattn-vec*.cpp")
 list(APPEND GGML_SOURCES_SYCL ${SRCS})
 
 target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL} ${GGML_SOURCES_SYCL})
+set_source_files_properties(xe2mx-quant.cpp PROPERTIES COMPILE_OPTIONS "-fno-sycl-early-optimizations")
+set_source_files_properties(xe2mx-s44-apack.cpp PROPERTIES COMPILE_OPTIONS "-fno-sycl-early-optimizations")
+
+# AOT only the ESIMD TUs. Free parallel_for lambdas in xe2mx.cpp
+# (pack_xmx, quant_a_f32, LO SOA, ...) SEGV in SYCL ProgramManager under
+# spir64_gen AOT (DeviceKernelInfo::setCompileTimeInfoIfNeeded). Keep those JIT.
+# s4.s4 kernels live in apack/panel; oneDNN GEMM is already external JIT.
+# Use GGML_SYCL_AOT_ARCH (not DEVICE_ARCH) so reconfigure does not lose the pin
+# after a one-shot FORCE clear of DEVICE_ARCH.
+if(NOT DEFINED GGML_SYCL_AOT_ARCH OR GGML_SYCL_AOT_ARCH STREQUAL "")
+  if(DEFINED GGML_SYCL_DEVICE_ARCH AND NOT GGML_SYCL_DEVICE_ARCH STREQUAL "")
+    set(GGML_SYCL_AOT_ARCH "${GGML_SYCL_DEVICE_ARCH}" CACHE STRING "spir64_gen AOT device (e.g. bmg_g31)" FORCE)
+  endif()
+endif()
+if(DEFINED GGML_SYCL_AOT_ARCH AND NOT GGML_SYCL_AOT_ARCH STREQUAL "")
+  set(_xe2mx_aot xe2mx-s44-apack.cpp panel-xmx.cpp)
+  foreach(_f ${_xe2mx_aot})
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_f}")
+      set_source_files_properties(${_f} PROPERTIES COMPILE_FLAGS
+        "-fsycl-targets=spir64_gen -Xsycl-target-backend=spir64_gen \"-device ${GGML_SYCL_AOT_ARCH}\"")
+    endif()
+  endforeach()
+  # clear global DEVICE_ARCH so rest stay JIT spir64
+  if(DEFINED GGML_SYCL_DEVICE_ARCH AND NOT GGML_SYCL_DEVICE_ARCH STREQUAL "")
+    set(GGML_SYCL_DEVICE_ARCH "" CACHE STRING "cleared; AOT only via GGML_SYCL_AOT_ARCH" FORCE)
+  endif()
+  message(STATUS "xe2mx AOT objs=${_xe2mx_aot} arch=${GGML_SYCL_AOT_ARCH}")
+endif()
+
 
 if (WIN32)
     # To generate a Visual Studio solution, using Intel C++ Compiler for ggml-sycl is mandatory
@@ -164,6 +193,11 @@ endif()
 
 if (GGML_SYCL_TARGET STREQUAL "INTEL")
     add_compile_definitions(GGML_SYCL_WARP_SIZE=16)
+    target_compile_options(ggml-sycl PRIVATE -fsycl-device-code-split=per_kernel)
+    target_link_options(
+        ggml-sycl PRIVATE
+        -fsycl-device-code-split=per_kernel
+    )
     if (NOT GGML_SYCL_DEVICE_ARCH)
         target_link_options(ggml-sycl PRIVATE -Xs -ze-intel-greater-than-4GB-buffer-required)
     else()

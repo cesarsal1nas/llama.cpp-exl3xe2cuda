@@ -62,6 +62,8 @@ extern "C" {
     GGML_API size_t                         ggml_backend_buffer_get_alloc_size(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor);
     GGML_API void                           ggml_backend_buffer_clear         (ggml_backend_buffer_t buffer, uint8_t value);
     GGML_API bool                           ggml_backend_buffer_is_host       (ggml_backend_buffer_t buffer);
+    // Copy the leading bytes of shard 0, at most nbytes. Returns bytes copied, or 0.
+    GGML_API size_t                         ggml_backend_meta_get_leading     (const struct ggml_tensor * tensor, void * data, size_t nbytes);
     GGML_API void                           ggml_backend_buffer_set_usage     (ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
     GGML_API enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage     (ggml_backend_buffer_t buffer);
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
@@ -208,6 +210,13 @@ extern "C" {
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    // Collapsed tensor-parallel executor: run every per-backend chunk graph and
+    // perform the inter-chunk reductions inline inside the backend. cgraphs is
+    // chunk-major: cgraphs[i*n_backends + j] is backend j's cgraph for chunk i.
+    // The last chunk gets no reduction (same as the default meta loop). Returns
+    // false when unsupported; in that case no work may have been submitted and
+    // the caller falls back to its default per-chunk loop.
+    typedef bool   (*ggml_backend_comm_graph_compute_t)(void * comm_ctx, struct ggml_cgraph ** cgraphs, size_t n_graphs);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);

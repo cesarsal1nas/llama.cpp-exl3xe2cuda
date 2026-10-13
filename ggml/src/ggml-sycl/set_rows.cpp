@@ -1,5 +1,6 @@
 #include "set_rows.hpp"
 #include "cpy.hpp"
+#include "fa_pkv_gen.hpp"
 
 #include "ggml-quants.h"
 
@@ -559,6 +560,21 @@ void ggml_sycl_op_set_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 
     GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32 || dst->src[0]->type == GGML_TYPE_F16);
     GGML_ASSERT(dst->src[1]->type == GGML_TYPE_I64 || dst->src[1]->type == GGML_TYPE_I32);
+
+    // Host gen bump only (no GPU sync). FA PKV uses this to detect K/V writes when
+    // padded n_kv is unchanged (get_n_kv pad window).
+    {
+        const ggml_tensor * base = dst;
+        while (base->view_src) {
+            base = base->view_src;
+        }
+        if (base->data) {
+            ggml_sycl_fa_pkv_note_write(base->data);
+        }
+        if (dst->data && dst->data != base->data) {
+            ggml_sycl_fa_pkv_note_write(dst->data);
+        }
+    }
 
     // dispatch on the index type (src1) and the source value type (src0)
     if (src0->type == GGML_TYPE_F16) {

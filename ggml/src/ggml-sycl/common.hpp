@@ -11,12 +11,15 @@
 //
 
 #ifndef GGML_SYCL_COMMON_HPP
+
 #define GGML_SYCL_COMMON_HPP
 
 #include <cstddef>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include "base.hpp"
 #include "dpct/helper.hpp"
@@ -55,6 +58,16 @@ namespace syclexp = sycl::ext::oneapi::experimental;
 #include "ggml-common.h"
 #pragma clang diagnostic pop
 #include "ggml-impl.h"
+#include <cstdio>
+#include <cstdlib>
+
+// Xe2 path progress/trace lines. Off unless GGML_SYCL_XE2_LOG=1.
+static inline bool ggml_sycl_xe2_log_on() {
+    static const int v = [] { const char * e = std::getenv("GGML_SYCL_XE2_LOG"); return e ? std::atoi(e) : 0; }();
+    return v != 0;
+}
+#define GGML_SYCL_XE2_LOG(...) do { if (ggml_sycl_xe2_log_on()) { fprintf(stderr, __VA_ARGS__); } } while (0)
+
 
 void* ggml_sycl_host_malloc(size_t size);
 void ggml_sycl_host_free(void* ptr);
@@ -215,6 +228,7 @@ inline dpct::err0 ggml_sycl_set_device(const int device) try {
 //////////////////////
 struct optimize_feature {
     bool reorder=false;
+    bool xe2mx_lo=false;
 };
 
 struct sycl_device_info {
@@ -346,6 +360,8 @@ struct ggml_backend_sycl_context {
     bool q5k_y_slots = false;
     bool q4k_y_slots = false;
 
+    queue_ptr ovl_q = nullptr;
+
     const void * moe_q8_src = nullptr;
     int          moe_q8_nrows = 0;
     int          moe_q8_padded = 0;
@@ -367,49 +383,67 @@ struct ggml_backend_sycl_context {
     }
 
     queue_ptr stream() {
+        if (ovl_q) {
+            return ovl_q;
+        }
         return stream(device, 0);
     }
 
 #if GGML_SYCL_DNNL
     dnnl::engine make_engine(sycl::queue* q) {
-        // Get the device associated with the queue
         sycl::device dev = q->get_device();
-        // Get the context associated with the queue
         sycl::context ctx = q->get_context();
         const dnnl::engine eng = dnnl::sycl_interop::make_engine(dev, ctx);
         return eng;
     }
 
-    std::unordered_map<sycl::queue*, dnnl::stream> stream_map;
-    std::unordered_map<sycl::queue*, dnnl::engine> engine_map;
+    static std::mutex & dnnl_map_mu() {
+        static std::mutex m;
+        return m;
+    }
+    static std::unordered_map<sycl::queue *, dnnl::engine> & dnnl_engines() {
+        static std::unordered_map<sycl::queue *, dnnl::engine> m;
+        return m;
+    }
+    static std::unordered_map<sycl::queue *, dnnl::stream> & dnnl_streams() {
+        static std::unordered_map<sycl::queue *, dnnl::stream> m;
+        return m;
+    }
+
     dnnl::stream stream_dnnl(int device, int _stream) {
         auto q = stream(device, _stream);
         return stream_dnnl(q);
     }
     dnnl::engine engine_dnnl(sycl::queue* qptr) {
-        auto it = engine_map.find(qptr);
-        if (it == engine_map.end()) {
-            auto eng = make_engine(qptr);
-            engine_map[qptr] = eng;
-            return eng;
-        }
-        else
-        {
+        std::lock_guard<std::mutex> lk(dnnl_map_mu());
+        auto & em = dnnl_engines();
+        auto it = em.find(qptr);
+        if (it != em.end()) {
             return it->second;
         }
+        auto eng = make_engine(qptr);
+        em[qptr] = eng;
+        return eng;
     }
     dnnl::stream stream_dnnl(sycl::queue* qptr) {
-        auto it = stream_map.find(qptr);
-        if (it == stream_map.end()) {
-            auto eng = engine_dnnl(qptr);
-            auto stream = dnnl::sycl_interop::make_stream(eng, *qptr);
-            stream_map[qptr] = stream;
-            return stream;
-        }
-        else
-        {
+        std::lock_guard<std::mutex> lk(dnnl_map_mu());
+        auto & sm = dnnl_streams();
+        auto it = sm.find(qptr);
+        if (it != sm.end()) {
             return it->second;
         }
+        auto & em = dnnl_engines();
+        auto eit = em.find(qptr);
+        dnnl::engine eng;
+        if (eit == em.end()) {
+            eng = make_engine(qptr);
+            em[qptr] = eng;
+        } else {
+            eng = eit->second;
+        }
+        auto strm = dnnl::sycl_interop::make_stream(eng, *qptr);
+        sm[qptr] = strm;
+        return strm;
     }
     dnnl::stream stream_dnnl() {
         return stream_dnnl(device, 0);
@@ -670,6 +704,8 @@ constexpr size_t ceil_div(const size_t m, const size_t n) {
 bool gpu_has_xmx(sycl::device &dev);
 
 int ggml_sycl_get_env(const char *env_name, int default_val);
+void ggml_sycl_env_cache_enable();
+void ggml_sycl_env_cache_invalidate();
 
 template <int N, class T> std::string debug_get_array_str(const std::string & prefix, const T array[N]) {
     if (LIKELY(!g_ggml_sycl_debug)) {
@@ -800,6 +836,17 @@ template <typename T>
 sycl::half2 __dpct_inline__ make_half2( T x, T y) {
     sycl::half2 res(static_cast<sycl::half>(x),static_cast<sycl::half>(y));
     return res;
+}
+
+static __dpct_inline__ int sycl_rint_i(float x) {
+    if (x > 127.0f) {
+        x = 127.0f;
+    }
+    if (x < -127.0f) {
+        x = -127.0f;
+    }
+    const float y = x + 12582912.0f;
+    return (int) sycl::bit_cast<uint32_t>(y) - 0x4B400000;
 }
 
 static __dpct_inline__ uint32_t fastdiv(uint32_t n, const sycl::uint3 fastdiv_values) {

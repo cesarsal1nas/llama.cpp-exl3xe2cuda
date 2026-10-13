@@ -1,6 +1,25 @@
 #include "norm.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/presets.hpp"
+#include "xe2mx-a8.hpp"
+
+static int sycl_norm_large_wg(int device) {
+    const int maxw = ggml_sycl_info().max_work_group_sizes[device];
+    int wg = 256;
+    if (maxw > 0 && wg > maxw) {
+        wg = maxw;
+    }
+    const int q = WARP_SIZE * WARP_SIZE;
+    if (wg >= q) {
+        wg = (wg / q) * q;
+    } else if (wg >= WARP_SIZE) {
+        wg = (wg / WARP_SIZE) * WARP_SIZE;
+    }
+    if (wg < WARP_SIZE) {
+        wg = WARP_SIZE;
+    }
+    return wg;
+}
 
 static void norm_f32(const float* x, float* dst, const int ncols,
     const int64_t src_stride_col, const int64_t src_stride_row, const int64_t src_stride_channel, const int64_t src_stride_sample,
@@ -231,7 +250,7 @@ static void l2_norm_f32(const float * x, float * dst, const int ncols,
     const int64_t src_stride_col, const int64_t src_stride_row, const int64_t src_stride_channel,
     const int64_t src_stride_sample, const int64_t dst_stride_col, const int64_t dst_stride_row,
     const int64_t dst_stride_channel, const int64_t dst_stride_sample, const float eps,
-    const sycl::nd_item<3>& item_ct1, float* s_sum, const int block_size) {
+    const sycl::nd_item<3>& item_ct1, float* s_sum, const int block_size, const int v4) {
 
     const int row     = item_ct1.get_group(2);
     const int channel = item_ct1.get_group(1);
@@ -241,18 +260,33 @@ static void l2_norm_f32(const float * x, float * dst, const int ncols,
     x   += sample*src_stride_sample + channel*src_stride_channel + row*src_stride_row;
     dst += sample*dst_stride_sample + channel*dst_stride_channel + row*dst_stride_row;
 
-    float tmp = 0.0f; // partial sum for thread in warp
-
-    for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[col * src_stride_col];
-        tmp += xi * xi;
+    float tmp = 0.0f;
+    const int use_v4 = v4 && src_stride_col == 1 && dst_stride_col == 1 && (ncols % 4) == 0;
+    if (use_v4) {
+        for (int col = tid * 4; col < ncols; col += block_size * 4) {
+            const sycl::float4 xi = *reinterpret_cast<const sycl::float4 *>(x + col);
+            tmp += xi.x() * xi.x() + xi.y() * xi.y() + xi.z() * xi.z() + xi.w() * xi.w();
+        }
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            const float xi = x[col * src_stride_col];
+            tmp += xi * xi;
+        }
     }
 
     tmp = block_reduce<block_reduce_method::SUM, warp_size>(tmp, s_sum, block_size);
     const float scale = sycl::rsqrt(sycl::fmax(tmp, eps * eps));
 
-    for (int col = tid; col < ncols; col += block_size) {
-        dst[col * dst_stride_col] = scale * x[col * src_stride_col];
+    if (use_v4) {
+        for (int col = tid * 4; col < ncols; col += block_size * 4) {
+            const sycl::float4 xi = *reinterpret_cast<const sycl::float4 *>(x + col);
+            *reinterpret_cast<sycl::float4 *>(dst + col) =
+                sycl::float4(scale * xi.x(), scale * xi.y(), scale * xi.z(), scale * xi.w());
+        }
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            dst[col * dst_stride_col] = scale * x[col * src_stride_col];
+        }
     }
 }
 
@@ -277,7 +311,7 @@ static void norm_f32_sycl(const float * x, float * dst, const int ncols, const i
             });
     }
     else {
-        const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
+        const int work_group_size = sycl_norm_large_wg(device);
         assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
         const sycl::range<3> block_dims(1, 1, work_group_size);
         /*
@@ -320,7 +354,7 @@ static void group_norm_f32_sycl(const float* x, float* dst,
             });
     }
     else {
-        const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
+        const int work_group_size = sycl_norm_large_wg(device);
         assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
         const sycl::range<3> block_dims(1, 1, work_group_size);
         /*
@@ -370,7 +404,7 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
             });
     }
     else {
-        const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
+        const int work_group_size = sycl_norm_large_wg(device);
         assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
         const sycl::range<3> block_dims(1, 1, work_group_size);
         /*
@@ -418,7 +452,7 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
             });
     }
     else {
-        const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
+        const int work_group_size = sycl_norm_large_wg(device);
         assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
         const sycl::range<3> block_dims(1, 1, work_group_size);
         stream->submit([&](sycl::handler& cgh) {
@@ -464,7 +498,7 @@ static void rms_norm_mul_add_f32_sycl(const float* x, const float* mul, const fl
             });
     }
     else {
-        const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
+        const int work_group_size = sycl_norm_large_wg(device);
         assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
         const sycl::range<3> block_dims(1, 1, work_group_size);
         stream->submit([&](sycl::handler& cgh) {
@@ -503,6 +537,7 @@ static void l2_norm_f32_sycl(const float *   x,
                              queue_ptr       stream,
                              int             device) {
     const dpct::dim3 blocks_num(nrows, nchannels, nsamples);
+    const int v4 = ggml_sycl_get_env("GGML_SYCL_L2_V4", 0);
 
     if (ncols < 1024) {
         const dpct::dim3 block_dims(warp_size, 1, 1);
@@ -516,12 +551,12 @@ static void l2_norm_f32_sycl(const float *   x,
                         src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
                         dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
                         eps, item_ct1,
-                        nullptr, warp_size);
+                        nullptr, warp_size, v4);
                 });
             });
     }
     else {
-        const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
+        const int work_group_size = sycl_norm_large_wg(device);
         assert(work_group_size % (warp_size * warp_size) == 0);
         const sycl::range<3> block_dims(1, 1, work_group_size);
         int lsm_size =  block_dims[2] > warp_size ? work_group_size / warp_size * sizeof(float): 0;
@@ -537,7 +572,7 @@ static void l2_norm_f32_sycl(const float *   x,
                     l2_norm_f32<warp_size>(x, dst, ncols,
                         src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
                         dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
-                        eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size);
+                        eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size, v4);
                 });
             });
     }
@@ -681,9 +716,23 @@ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
 
+    if (ggml_sycl_get_env("GGML_SYCL_XE2MX_S44RMSHILP", 0)
+        && mul_tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(mul_tensor)
+        && ggml_is_contiguous(rms_norm_src) && mul_src && ggml_is_contiguous(mul_src)
+        && (ne00 % 128) == 0 && ne00 >= 128 && ggml_nrows(mul_tensor) >= 32) {
+        if (ggml_sycl_xe2mx_s44_rms_hilp(main_stream, mul_tensor, src0_dd, mul_dd, dst_dd,
+                                         ggml_nrows(mul_tensor), ne00, eps)) {
+            return;
+        }
+    }
     rms_norm_mul_f32_sycl(src0_dd, mul_dd, dst_dd, ne00, ne01, ne02, ne03,
         s00, s01, s02, s03, d00, d01, d02, d03,
         mul_s01, mul_s02, mul_s03, mul_nrows, mul_nchannels, mul_nsamples, eps, main_stream, ctx.device);
+    if (ggml_sycl_get_env("GGML_SYCL_XE2MX_S44RMSPACK", 0)
+        && mul_tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(mul_tensor)
+        && (ne00 % 128) == 0 && ne00 >= 128 && ggml_nrows(mul_tensor) >= 32) {
+        ggml_sycl_xe2mx_s44_pack_xf(main_stream, mul_tensor, dst_dd, ggml_nrows(mul_tensor), ne00);
+    }
 }
 
 void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
@@ -773,33 +822,69 @@ void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tenso
 
 static void add_rms_norm_mul_f32_vec4(const float * a, const float * b, float * add_dst, const float * mul,
                                       float * dst, const int ncols, const int nrows, const float eps,
-                                      queue_ptr stream, int device) {
-    const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
+                                      queue_ptr stream, int device, int drop_add, uint8_t * A4, float * sa,
+                                      int pg = 1024) {
+    int work_group_size = ggml_sycl_get_env("GGML_SYCL_ADD_RMS_WG", 256);
+    if (work_group_size != 64 && work_group_size != 128 && work_group_size != 512) {
+        work_group_size = sycl_norm_large_wg(device);
+    }
+    const int nvec = ncols / 4;
+    const int npass = (nvec + work_group_size - 1) / work_group_size;
     const sycl::range<3> global_dims(1, 1, nrows);
     const sycl::range<3> block_dims(1, 1, work_group_size);
+    if (pg != 128 && pg != 256 && pg != 512 && pg != 1024) {
+        pg = 1024;
+    }
+    const bool pack = A4 && sa && work_group_size == 256 && npass <= 16 && ncols <= 8192 && (ncols % pg) == 0;
+    const int clipp = ggml_sycl_get_env("GGML_SYCL_XE2MX_S44CLIP", 100);
+    const float clipv = (clipp > 0 && clipp <= 100) ? (float) clipp / 100.0f : 1.0f;
+    const int adivp = ggml_sycl_get_env("GGML_SYCL_XE2MX_S44ADIV", 7);
+    const float adivv = (adivp >= 4 && adivp <= 8) ? (float) adivp : 7.0f;
     stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<float, 1> s_sum_acc_ct1(sycl::range<1>(work_group_size / WARP_SIZE), cgh);
+        sycl::local_accessor<float, 1> row_acc(sycl::range<1>(pack ? (size_t) ncols : 1), cgh);
+        sycl::local_accessor<float, 1> umax_acc(sycl::range<1>(16), cgh);
         cgh.parallel_for(sycl::nd_range<3>(global_dims * block_dims, block_dims),
                          [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                              const int row     = item_ct1.get_group(2);
                              const int tid     = item_ct1.get_local_id(2);
                              const int nthreads = item_ct1.get_local_range(2);
                              const int nwarps  = nthreads / WARP_SIZE;
-                             const int nvec    = ncols / 4;
                              const float * ar  = a + row * ncols;
                              const float * br  = b + row * ncols;
-                             float *       sr  = add_dst + row * ncols;
+                             float *       sr  = drop_add ? nullptr : add_dst + row * ncols;
                              float *       dr  = dst + row * ncols;
                              const float * mr  = mul;
 
+                             sycl::float4 svs[16];
+                             int idxs[16];
+                             int nown = 0;
                              float tmp = 0.0f;
-                             for (int i = tid; i < nvec; i += nthreads) {
-                                 const sycl::float4 av = *reinterpret_cast<const sycl::float4 *>(ar + i * 4);
-                                 const sycl::float4 bv = *reinterpret_cast<const sycl::float4 *>(br + i * 4);
-                                 const sycl::float4 sv = sycl::float4(av.x() + bv.x(), av.y() + bv.y(),
-                                                                    av.z() + bv.z(), av.w() + bv.w());
-                                 *reinterpret_cast<sycl::float4 *>(sr + i * 4) = sv;
-                                 tmp += sv.x() * sv.x() + sv.y() * sv.y() + sv.z() * sv.z() + sv.w() * sv.w();
+                             if (npass <= 16) {
+                                 for (int i = tid; i < nvec; i += nthreads) {
+                                     const sycl::float4 av = *reinterpret_cast<const sycl::float4 *>(ar + i * 4);
+                                     const sycl::float4 bv = *reinterpret_cast<const sycl::float4 *>(br + i * 4);
+                                     const sycl::float4 sv = sycl::float4(av.x() + bv.x(), av.y() + bv.y(),
+                                                                        av.z() + bv.z(), av.w() + bv.w());
+                                     if (sr) {
+                                         *reinterpret_cast<sycl::float4 *>(sr + i * 4) = sv;
+                                     }
+                                     svs[nown] = sv;
+                                     idxs[nown] = i;
+                                     nown++;
+                                     tmp += sv.x() * sv.x() + sv.y() * sv.y() + sv.z() * sv.z() + sv.w() * sv.w();
+                                 }
+                             } else {
+                                 for (int i = tid; i < nvec; i += nthreads) {
+                                     const sycl::float4 av = *reinterpret_cast<const sycl::float4 *>(ar + i * 4);
+                                     const sycl::float4 bv = *reinterpret_cast<const sycl::float4 *>(br + i * 4);
+                                     const sycl::float4 sv = sycl::float4(av.x() + bv.x(), av.y() + bv.y(),
+                                                                        av.z() + bv.z(), av.w() + bv.w());
+                                     if (sr) {
+                                         *reinterpret_cast<sycl::float4 *>(sr + i * 4) = sv;
+                                     }
+                                     tmp += sv.x() * sv.x() + sv.y() * sv.y() + sv.z() * sv.z() + sv.w() * sv.w();
+                                 }
                              }
                              tmp = warp_reduce_sum(tmp, item_ct1);
                              float * s_sum = get_pointer(s_sum_acc_ct1);
@@ -817,19 +902,211 @@ static void add_rms_norm_mul_f32_vec4(const float * a, const float * b, float * 
                              }
                              tmp                 = warp_reduce_sum(tmp, item_ct1);
                              const float scale   = sycl::rsqrt(tmp / ncols + eps);
-                             for (int i = tid; i < nvec; i += nthreads) {
-                                 const sycl::float4 sv = *reinterpret_cast<const sycl::float4 *>(sr + i * 4);
-                                 const sycl::float4 mv = *reinterpret_cast<const sycl::float4 *>(mr + i * 4);
-                                 *reinterpret_cast<sycl::float4 *>(dr + i * 4) = sycl::float4(
-                                     scale * sv.x() * mv.x(), scale * sv.y() * mv.y(),
-                                     scale * sv.z() * mv.z(), scale * sv.w() * mv.w());
+                             float * yslm = pack ? get_pointer(row_acc) : nullptr;
+                             if (npass <= 16) {
+                                 for (int k = 0; k < nown; k++) {
+                                     const int i = idxs[k];
+                                     const sycl::float4 sv = svs[k];
+                                     const sycl::float4 mv = *reinterpret_cast<const sycl::float4 *>(mr + i * 4);
+                                     const sycl::float4 yv = sycl::float4(
+                                         scale * sv.x() * mv.x(), scale * sv.y() * mv.y(),
+                                         scale * sv.z() * mv.z(), scale * sv.w() * mv.w());
+                                     *reinterpret_cast<sycl::float4 *>(dr + i * 4) = yv;
+                                     if (yslm) {
+                                         *reinterpret_cast<sycl::float4 *>(yslm + i * 4) = yv;
+                                     }
+                                 }
+                             } else {
+                                 for (int i = tid; i < nvec; i += nthreads) {
+                                     sycl::float4 sv;
+                                     if (sr) {
+                                         sv = *reinterpret_cast<const sycl::float4 *>(sr + i * 4);
+                                     } else {
+                                         const sycl::float4 av = *reinterpret_cast<const sycl::float4 *>(ar + i * 4);
+                                         const sycl::float4 bv = *reinterpret_cast<const sycl::float4 *>(br + i * 4);
+                                         sv = sycl::float4(av.x() + bv.x(), av.y() + bv.y(),
+                                                           av.z() + bv.z(), av.w() + bv.w());
+                                     }
+                                     const sycl::float4 mv = *reinterpret_cast<const sycl::float4 *>(mr + i * 4);
+                                     *reinterpret_cast<sycl::float4 *>(dr + i * 4) = sycl::float4(
+                                         scale * sv.x() * mv.x(), scale * sv.y() * mv.y(),
+                                         scale * sv.z() * mv.z(), scale * sv.w() * mv.w());
+                                 }
+                             }
+                             if (yslm && pg == 1024) {
+                                 item_ct1.barrier(sycl::access::fence_space::local_space);
+                                 const int ng = ncols / 1024;
+                                 const int lane = tid & 15;
+                                 const int sgid = tid >> 4;
+                                 const sycl::sub_group sg = item_ct1.get_sub_group();
+                                 const float inv = 0.08838834764831845f;
+                                 uint8_t * adst = A4 + (size_t) row * (size_t) (ncols / 2);
+                                 float * sar = sa + (size_t) row * (size_t) ng;
+                                 for (int ig = 0; ig < ng; ++ig) {
+                                     float ael[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                                     float amax = 0.0f;
+                                     if (tid < 128) {
+                                         const int base = ig * 1024 + sgid * 128 + lane * 8;
+                                         const sycl::vec<float, 8> vf =
+                                             *reinterpret_cast<const sycl::vec<float, 8> *>(yslm + base);
+                                         const sycl::vec<sycl::half, 8> vh =
+                                             vf.convert<sycl::half, sycl::rounding_mode::rte>();
+#pragma unroll
+                                         for (int e = 0; e < 8; ++e) {
+                                             ael[e] = sycl::fmin(sycl::fmax((float) vh[e], -65504.0f), 65504.0f);
+                                         }
+#pragma unroll
+                                         for (int h = 1; h < 8; h *= 2) {
+#pragma unroll
+                                             for (int j = 0; j < 8; j += 2 * h) {
+#pragma unroll
+                                                 for (int kk = 0; kk < h; ++kk) {
+                                                     const float ax = ael[j + kk];
+                                                     const float ay = ael[j + kk + h];
+                                                     ael[j + kk] = ax + ay;
+                                                     ael[j + kk + h] = ax - ay;
+                                                 }
+                                             }
+                                         }
+#pragma unroll
+                                         for (int h = 8, xm = 1; h < 128; h *= 2, xm *= 2) {
+#pragma unroll
+                                             for (int j = 0; j < 8; ++j) {
+                                                 const float a2 = sycl::permute_group_by_xor(sg, ael[j], (uint32_t) xm);
+                                                 ael[j] = (lane & xm) == 0 ? ael[j] + a2 : a2 - ael[j];
+                                             }
+                                         }
+#pragma unroll
+                                         for (int e = 0; e < 8; ++e) {
+                                             ael[e] = ael[e] * inv;
+                                             amax = sycl::fmax(amax, sycl::fabs(ael[e]));
+                                         }
+                                     }
+                                     const float gmax = sycl::reduce_over_group(item_ct1.get_group(), amax, sycl::maximum<float>());
+                                     const float sc = gmax > 0.0f ? (gmax * clipv) / adivv : 0.0f;
+                                     if (tid == 0) {
+                                         sar[ig] = sc;
+                                     }
+                                     const float id = sc > 0.0f ? 1.0f / sc : 0.0f;
+                                     if (tid < 128) {
+#pragma unroll
+                                         for (int t = 0; t < 4; ++t) {
+                                             int q0 = (int) sycl_rint_i(ael[t * 2] * id);
+                                             int q1 = (int) sycl_rint_i(ael[t * 2 + 1] * id);
+                                             if (q0 < -8) q0 = -8;
+                                             if (q0 > 7) q0 = 7;
+                                             if (q1 < -8) q1 = -8;
+                                             if (q1 > 7) q1 = 7;
+                                             const uint8_t u0 = (uint8_t) (int8_t) q0;
+                                             const uint8_t u1 = (uint8_t) (int8_t) q1;
+                                             adst[(size_t) ig * 512u + (size_t) sgid * 64u + (size_t) lane * 4u + (size_t) t] =
+                                                 (uint8_t) ((u0 & 15u) | (uint8_t) ((u1 & 15u) << 4));
+                                         }
+                                     }
+                                 }
+                             }
+                             if (yslm && pg < 1024) {
+                                 // Narrow groups: each 16-lane unit owns one 128-wide Hadamard block,
+                                 // nblk units make one group, 16 / nblk groups per pass.
+                                 item_ct1.barrier(sycl::access::fence_space::local_space);
+                                 float * umax = get_pointer(umax_acc);
+                                 const int ng = ncols / pg;
+                                 const int nblk = pg / 128;
+                                 const int gpp = 16 / nblk;
+                                 const int lane = tid & 15;
+                                 const int unit = tid >> 4;
+                                 const int sub = unit % nblk;
+                                 const sycl::sub_group sg = item_ct1.get_sub_group();
+                                 const float inv = 0.08838834764831845f;
+                                 uint8_t * adst = A4 + (size_t) row * (size_t) (ncols / 2);
+                                 float * sar = sa + (size_t) row * (size_t) ng;
+                                 for (int p0 = 0; p0 < ng; p0 += gpp) {
+                                     const int ig = p0 + unit / nblk;
+                                     const bool live = ig < ng;
+                                     float ael[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                                     if (live) {
+                                         const int base = ig * pg + sub * 128 + lane * 8;
+                                         const sycl::vec<float, 8> vf =
+                                             *reinterpret_cast<const sycl::vec<float, 8> *>(yslm + base);
+                                         const sycl::vec<sycl::half, 8> vh =
+                                             vf.convert<sycl::half, sycl::rounding_mode::rte>();
+#pragma unroll
+                                         for (int e = 0; e < 8; ++e) {
+                                             ael[e] = sycl::fmin(sycl::fmax((float) vh[e], -65504.0f), 65504.0f);
+                                         }
+#pragma unroll
+                                         for (int h = 1; h < 8; h *= 2) {
+#pragma unroll
+                                             for (int j = 0; j < 8; j += 2 * h) {
+#pragma unroll
+                                                 for (int kk = 0; kk < h; ++kk) {
+                                                     const float ax = ael[j + kk];
+                                                     const float ay = ael[j + kk + h];
+                                                     ael[j + kk] = ax + ay;
+                                                     ael[j + kk + h] = ax - ay;
+                                                 }
+                                             }
+                                         }
+                                     }
+#pragma unroll
+                                     for (int h = 8, xm = 1; h < 128; h *= 2, xm *= 2) {
+#pragma unroll
+                                         for (int j = 0; j < 8; ++j) {
+                                             const float a2 = sycl::permute_group_by_xor(sg, ael[j], (uint32_t) xm);
+                                             ael[j] = (lane & xm) == 0 ? ael[j] + a2 : a2 - ael[j];
+                                         }
+                                     }
+                                     float amax = 0.0f;
+#pragma unroll
+                                     for (int e = 0; e < 8; ++e) {
+                                         ael[e] = ael[e] * inv;
+                                         amax = sycl::fmax(amax, sycl::fabs(ael[e]));
+                                     }
+#pragma unroll
+                                     for (int xm = 1; xm < 16; xm *= 2) {
+                                         amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, (uint32_t) xm));
+                                     }
+                                     float gmax = amax;
+                                     if (nblk > 1) {
+                                         if (lane == 0) {
+                                             umax[unit] = amax;
+                                         }
+                                         item_ct1.barrier(sycl::access::fence_space::local_space);
+                                         const int u0 = (unit / nblk) * nblk;
+                                         gmax = umax[u0];
+                                         for (int u = 1; u < nblk; ++u) {
+                                             gmax = sycl::fmax(gmax, umax[u0 + u]);
+                                         }
+                                         item_ct1.barrier(sycl::access::fence_space::local_space);
+                                     }
+                                     const float sc = gmax > 0.0f ? (gmax * clipv) / adivv : 0.0f;
+                                     if (live && sub == 0 && lane == 0) {
+                                         sar[ig] = sc;
+                                     }
+                                     const float id = sc > 0.0f ? 1.0f / sc : 0.0f;
+                                     if (live) {
+#pragma unroll
+                                         for (int t = 0; t < 4; ++t) {
+                                             int q0 = (int) sycl_rint_i(ael[t * 2] * id);
+                                             int q1 = (int) sycl_rint_i(ael[t * 2 + 1] * id);
+                                             if (q0 < -8) q0 = -8;
+                                             if (q0 > 7) q0 = 7;
+                                             if (q1 < -8) q1 = -8;
+                                             if (q1 > 7) q1 = 7;
+                                             const uint8_t w0 = (uint8_t) (int8_t) q0;
+                                             const uint8_t w1 = (uint8_t) (int8_t) q1;
+                                             adst[(size_t) ig * (size_t) (pg / 2) + (size_t) sub * 64u + (size_t) lane * 4u + (size_t) t] =
+                                                 (uint8_t) ((w0 & 15u) | (uint8_t) ((w1 & 15u) << 4));
+                                         }
+                                     }
+                                 }
                              }
                          });
     });
 }
 
 void ggml_sycl_op_add_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * add, ggml_tensor * rms,
-                                     ggml_tensor * mul) {
+                                     ggml_tensor * mul, int drop_add) {
     float eps = 0.0f;
     memcpy(&eps, rms->op_params, sizeof(float));
 
@@ -853,8 +1130,19 @@ void ggml_sycl_op_add_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tenso
     GGML_ASSERT(ggml_is_contiguous(add) && ggml_is_contiguous(add->src[0]) && ggml_is_contiguous(add->src[1]));
     GGML_ASSERT(ggml_is_contiguous(mul));
 
+    uint8_t * A4 = nullptr;
+    float * sap = nullptr;
+    int packg = 1024;
+    if (add->ne[2] == 1 && add->ne[3] == 1) {
+        ggml_sycl_xe2mx_s44_add_rms_bufs(main_stream, mul, dst_dd, add->ne[1], add->ne[0], &A4, &sap, &packg);
+    }
     add_rms_norm_mul_f32_vec4(a_dd, b_dd, sum_dd, mul_dd, dst_dd, (int) add->ne[0], (int) add->ne[1], eps, main_stream,
-                              ctx.device);
+                              ctx.device, drop_add, A4, sap, packg);
+    if (ggml_sycl_get_env("GGML_SYCL_XE2MX_S44RMSPACK", 0)
+        && mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul)
+        && (mul->ne[0] % 128) == 0 && mul->ne[0] >= 128 && ggml_nrows(mul) >= 32) {
+        ggml_sycl_xe2mx_s44_pack_xf(main_stream, mul, dst_dd, ggml_nrows(mul), mul->ne[0]);
+    }
 }
 
 void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {

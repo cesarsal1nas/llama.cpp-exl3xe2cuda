@@ -7,9 +7,11 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -1674,6 +1676,22 @@ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
     return buf != nullptr && buf->iface.free_buffer == ggml_backend_meta_buffer_iface.free_buffer;
 }
 
+size_t ggml_backend_meta_get_leading(const struct ggml_tensor * tensor, void * data, size_t nbytes) {
+    if (!tensor || !data || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return 0;
+    }
+    ggml_tensor * shard = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
+    if (!shard) {
+        return 0;
+    }
+    const size_t n = std::min(nbytes, ggml_nbytes(shard));
+    if (n == 0) {
+        return 0;
+    }
+    ggml_backend_tensor_get(shard, data, 0, n);
+    return n;
+}
+
 void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
@@ -1804,6 +1822,7 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    ggml_backend_comm_graph_compute_t    comm_graph_compute = nullptr;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -1835,6 +1854,10 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+            // optional: collapsed per-backend chunk executor with inline reductions
+            comm_graph_compute = (ggml_backend_comm_graph_compute_t)
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
+                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_graph_compute");
         }
     }
 
@@ -2316,6 +2339,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
     auto allreduce_fallback = [&](size_t i) -> ggml_status {
+        {
+            static int nfb = 0;
+            if (nfb < 8) {
+                nfb++;
+                fprintf(stderr, "xe2mx tp fallback allreduce i=%zu\n", i);
+                fflush(stderr);
+            }
+        }
         std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
 
         // Zero out nodes that were disabled due to having a zero-sized slice:
@@ -2431,13 +2462,59 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    // Env-gated collapsed executor: hand every per-backend chunk graph to the
+    // backend's comm_graph_compute (SYCL: one submission stream per card with
+    // the allreduce rendezvous inline) instead of the per-chunk
+    // graph_compute_async + comm_allreduce loop below.
+    static const bool tp_exec = [] {
+        const char * e = getenv("GGML_SYCL_XE2MX_TP_EXEC");
+        return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+    }();
+    if (tp_exec && n_backends == 2 && backend_ctx->comm_ctx != nullptr && backend_ctx->comm_graph_compute != nullptr) {
+        static int nexec = 0;
+        if (nexec++ < 2) {
+            fprintf(stderr, "xe2mx tp exec collapse subgraphs=%zu backends=2\n", backend_ctx->n_subgraphs);
+            fflush(stderr);
+        }
+        std::vector<ggml_cgraph *> chunk_graphs(n_backends * backend_ctx->n_subgraphs, nullptr);
+        for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+            for (size_t j = 0; j < n_backends; j++) {
+                chunk_graphs[i*n_backends + j] = backend_ctx->backend_configs[j].cgraphs[i].cgraph_main;
+            }
+        }
+        if (backend_ctx->comm_graph_compute(backend_ctx->comm_ctx, chunk_graphs.data(), chunk_graphs.size())) {
+            return GGML_STATUS_SUCCESS;
+        }
+        // unsupported: fall through to the default per-chunk loop below
+    }
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        if (i == 0) {
+            static int nlog = 0;
+            if (nlog < 2) {
+                nlog++;
+                fprintf(stderr, "xe2mx tp subgraphs=%zu backends=%zu nodes0=%d\n",
+                        backend_ctx->n_subgraphs, n_backends,
+                        backend_ctx->backend_configs[0].cgraphs[0].cgraph_main->n_nodes);
+                fflush(stderr);
+            }
+        }
+        const auto t_comp0 = std::chrono::steady_clock::now();
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
+        }
+        const double comp_us = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - t_comp0).count();
+        static int ncomp = 0;
+        static double comp_sum = 0;
+        comp_sum += comp_us;
+        if (++ncomp == 64) {
+            fprintf(stderr, "xe2mx tp comp avg_us=%.1f\n", comp_sum / ncomp);
+            fflush(stderr);
         }
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {

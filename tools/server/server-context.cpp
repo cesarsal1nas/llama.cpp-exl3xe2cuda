@@ -551,8 +551,10 @@ struct server_slot {
 
             state = SLOT_STATE_IDLE;
 
-            // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child()) {
+            // Hybrid/recurrent models cannot roll a reused slot back to a clean prompt.
+            // Keeping the previous answer in the slot makes the next request sample EOS.
+            const llama_model * mdl = llama_get_model(ctx_tgt);
+            if (task->is_child() || llama_model_is_hybrid(mdl) || llama_model_is_recurrent(mdl)) {
                 prompt_clear();
             }
 
@@ -3055,8 +3057,8 @@ private:
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
 
-                // EXL3: keep drafted MTP KV. IQ/Q still wipe and re-eval.
-                if (!llama_model_has_exl3(model_tgt)) {
+                // Keep-KV must agree with the MTP catch-up policy.
+                if (!llama_model_has_exl3(model_tgt) && !common_speculative_keeps_draft_kv(spec.get())) {
                     if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
                         GGML_ABORT("failed to remove sequence %d\n", slot.id);
                     }

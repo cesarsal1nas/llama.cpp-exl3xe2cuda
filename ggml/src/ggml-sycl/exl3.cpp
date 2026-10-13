@@ -989,8 +989,7 @@ void quant_x_i8_kernel(const float * x, int8_t * x_i8, float * qs, int * xsum,
     const float v  = x[size_t(row) * size_t(size_k) + size_t(kt) * 16 + lane];
     const float mx = sycl::reduce_over_group(it.get_group(), sycl::fabs(v), sycl::maximum<float>());
     const float q_s = (mx < 1e-8f ? 1e-8f : mx) / 127.0f;
-    int iv = int(sycl::rint(v / q_s));
-    iv = iv > 127 ? 127 : (iv < -127 ? -127 : iv);
+    int iv = sycl_rint_i(v / q_s);
     x_i8[size_t(row) * size_t(size_k) + size_t(kt) * 16 + lane] = int8_t(iv);
     const int s = sycl::reduce_over_group(it.get_group(), iv, sycl::plus<int>());
     if (lane == 0) {
@@ -1335,8 +1334,7 @@ void gemv_kernel(const float * x, const uint32_t * B, float * C,
                 float s = 0.0f;
 #pragma unroll
                 for (int k = 0; k < 16; ++k) {
-                    int v = int(sycl::rint(x16[r * 16 + k] * rq));
-                    v = v > 127 ? 127 : (v < -127 ? -127 : v);
+                    int v = sycl_rint_i(x16[r * 16 + k] * rq);
                     s += float(v);
                     if (lane < 16 && k == lane) {
                         sh_x[r * 16 + k] = float(v);

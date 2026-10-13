@@ -5585,6 +5585,7 @@ class GGMLQuantizationType(IntEnum):
     EXL3_6  = 48
     EXL3_7  = 49
     EXL3_8  = 50
+    XE2MX4  = 51
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5641,6 +5642,7 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    MOSTLY_XE2MX4        = 42  # except 1d tensors
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -5786,6 +5788,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.EXL3_6:  (256, 192),
     GGMLQuantizationType.EXL3_7:  (256, 224),
     GGMLQuantizationType.EXL3_8:  (256, 256),
+    GGMLQuantizationType.XE2MX4:  (32, 2 + 16),
 }
 
 

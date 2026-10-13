@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include "dequantize.hpp"
 #include "presets.hpp"
+#include "xe2mx.hpp"
 
 #if defined(__INTEL_LLVM_COMPILER)
     #if __has_include(<sycl/ext/oneapi/bfloat16.hpp>)
@@ -1512,6 +1513,27 @@ static void dequantize_mul_mat_vec_q4_0_sycl_reorder(const void *vx, const dfloa
 }
 
 
+static void dequantize_mul_mat_vec_xe2mx4_sycl(const void *vx, const dfloat *y,
+                                             float *dst, const int ncols,
+                                             const int nrows,
+                                             dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % GGML_SYCL_DMMV_X == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+        dpct::has_capability_or_fail(stream->get_device(),
+                                     {sycl::aspect::fp16});
+
+        stream->parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                dequantize_mul_mat_vec<QK_XE2MX4, QR_XE2MX4, dequantize_xe2mx4>(
+                    vx, y, dst, ncols, nrows, item_ct1);
+            });
+    }
+}
+
 static void dequantize_mul_mat_vec_q4_0_sycl(const void *vx, const dfloat *y,
                                              float *dst, const int ncols,
                                              const int nrows,
@@ -2723,6 +2745,11 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
             } else {
                 dequantize_mul_mat_vec_q4_0_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
             }
+            break;
+        case GGML_TYPE_XE2MX4:
+            GGML_ASSERT(ggml_sycl_xe2mx_lo_bytes_are_soa(src0) &&
+                        "LO_INLINE weight cannot use block_xe2mx4 dmmv");
+            dequantize_mul_mat_vec_xe2mx4_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q4_1:
             dequantize_mul_mat_vec_q4_1_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);

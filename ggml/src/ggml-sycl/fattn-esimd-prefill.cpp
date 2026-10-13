@@ -333,168 +333,234 @@ ESIMD_INLINE void fattn_prefill_q4_0_dpas(const int8_t * Q8, const float * Qc, c
     }
 }
 
-// f16×f16 XMX dpas on staged dense Q/K/V (same buffers oneDNN Graph SDPA consumes).
-// kv-head grid, GQA RQ heads share each 16-key K tile. Not q4_0-in-kernel.
-template <int BM, int RQ>
+// f16xf16 XMX dpas on staged dense Q/K/V. Full-D scores (hd halves SLM-add before softmax).
+template <int BM, int T, int CH>
 ESIMD_INLINE void fattn_prefill_f16_dpas(const sycl::half * Qf, const sycl::half * Kf, const sycl::half * Vf,
                                          const char * mask, float * dst, const int mask_stride, const int n_kv,
-                                         const int n_kvh, const int n_head, const int ntok, const float scale,
-                                         const sycl::nd_item<1> & it) {
-    constexpr int MR   = 8;
-    constexpr int D    = 256;
-    constexpr int HALF = 128;
+                                         const int n_kvh, const int n_head, const int ntok, const int gqa,
+                                         const float scale, const sycl::nd_item<1> & it) {
+    constexpr int MR     = 8;
+    constexpr int D      = 256;
+    constexpr int HALF   = 128;
+    constexpr int KEYS   = T * CH * 16;
+    constexpr int SLOT_F = BM * HALF + 2 * BM;
+    constexpr int NSLOT  = (T / 2 > 0 ? T / 2 : 1) * 2;
+    constexpr int SSLM   = T * 2 * BM * 16;
     static_assert(BM == MR, "XMX MR=8");
-    slm_init<2 * RQ * BM * HALF * 4>();
+    static_assert((T % 2) == 0, "T even");
+    slm_init<(SSLM > NSLOT * SLOT_F ? SSLM : NSLOT * SLOT_F) * 4>();
 
     const int g     = it.get_group(0);
-    const int h     = g % n_kvh;
-    const int qtile = g / n_kvh;
-    const int hd    = (int) it.get_local_id(0) & 1;
+    const int hq    = g % n_head;
+    const int qtile = g / n_head;
+    const int h     = hq / gqa;
+    const int lid   = (int) it.get_local_id(0);
+    const int t     = lid % T;
+    const int hd    = (lid / T) & 1;
     const int tok0  = qtile * BM;
-    const uint32_t o_base = (uint32_t) hd * RQ * BM * HALF * 4;
 
-    simd<float, HALF> O[RQ][BM];
-    float m[RQ][BM], lsum[RQ][BM];
+    simd<sycl::half, 16> Qd[BM][HALF / 16];
 #pragma unroll
-    for (int r = 0; r < RQ; ++r) {
+    for (int b = 0; b < BM; ++b) {
+        const int tok = tok0 + b < ntok ? tok0 + b : ntok - 1;
+        const sycl::half * qp = Qf + ((size_t) hq * ntok + (size_t) tok) * D + hd * HALF;
 #pragma unroll
-        for (int b = 0; b < BM; ++b) {
-            O[r][b]    = 0.0f;
-            m[r][b]    = -FLT_MAX / 2.0f;
-            lsum[r][b] = 0.0f;
+        for (int dd = 0; dd < HALF / 16; ++dd) {
+            Qd[b][dd] = block_load<sycl::half, 16>(qp + 16 * dd);
         }
     }
 
-    auto load16 = [&](const sycl::half * p) { return block_load<sycl::half, 16>(p); };
+    simd<float, HALF> O[BM];
+    float m[BM], lsum[BM];
+#pragma unroll
+    for (int b = 0; b < BM; ++b) {
+        O[b]    = 0.0f;
+        m[b]    = -FLT_MAX / 2.0f;
+        lsum[b] = 0.0f;
+    }
 
-    for (int key = 0; key < n_kv; key += 16) {
-        simd<sycl::half, 16> Kd[16][HALF / 16];
-        simd<sycl::half, 16> Vd[16][HALF / 16];
+    for (int kbase = 0; kbase < n_kv; kbase += KEYS) {
 #pragma unroll
-        for (int n = 0; n < 16; ++n) {
-            const int kk = key + n < n_kv ? key + n : n_kv - 1;
-            const sycl::half * kp = Kf + ((size_t) h * n_kv + (size_t) kk) * D + hd * HALF;
-            const sycl::half * vp = Vf + ((size_t) h * n_kv + (size_t) kk) * D + hd * HALF;
-#pragma unroll
-            for (int dd = 0; dd < HALF / 16; ++dd) {
-                Kd[n][dd] = load16(kp + 16 * dd);
-                Vd[n][dd] = load16(vp + 16 * dd);
-            }
-        }
-        simd<sycl::half, 16> mk[BM];
-#pragma unroll
-        for (int b = 0; b < BM; ++b) {
-            const int tok = tok0 + b < ntok ? tok0 + b : ntok - 1;
-            const uint16_t * mrow = (const uint16_t *) (mask + (size_t) mask_stride * tok);
-            simd<uint16_t, 16> mu = block_load<uint16_t, 16>(mrow + key);
-            mk[b] = mu.template bit_cast_view<sycl::half>();
-        }
-
-#pragma unroll
-        for (int r = 0; r < RQ; ++r) {
-            const int hq = h * RQ + r;
-            simd<sycl::half, 16> Qd[BM][HALF / 16];
-#pragma unroll
-            for (int b = 0; b < BM; ++b) {
-                const int tok = tok0 + b < ntok ? tok0 + b : ntok - 1;
-                const sycl::half * qp = Qf + ((size_t) hq * ntok + (size_t) tok) * D + hd * HALF;
-#pragma unroll
-                for (int dd = 0; dd < HALF / 16; ++dd) {
-                    Qd[b][dd] = load16(qp + 16 * dd);
-                }
-            }
-
+        for (int c = 0; c < CH; ++c) {
+            const int key = kbase + t * CH * 16 + c * 16;
+            const int live = key < n_kv ? 1 : 0;
+            simd<sycl::half, 16> Kd[16][HALF / 16];
+            simd<sycl::half, 16> Vd[16][HALF / 16];
+            simd<sycl::half, 16> mk[BM];
             simd<float, 16> S[BM];
 #pragma unroll
             for (int b = 0; b < BM; ++b) {
                 S[b] = 0.0f;
             }
-#pragma unroll
-            for (int dd = 0; dd < HALF / 16; ++dd) {
-                simd<sycl::half, MR * 16> A;
-#pragma unroll
-                for (int b = 0; b < BM; ++b) {
-                    A.template select<16, 1>(16 * b) = Qd[b][dd];
-                }
-                simd<sycl::half, 256> B;
+            if (live) {
 #pragma unroll
                 for (int n = 0; n < 16; ++n) {
+                    const int kk = key + n < n_kv ? key + n : n_kv - 1;
+                    const sycl::half * kp = Kf + ((size_t) h * n_kv + (size_t) kk) * D + hd * HALF;
+                    const sycl::half * vp = Vf + ((size_t) h * n_kv + (size_t) kk) * D + hd * HALF;
 #pragma unroll
-                    for (int kk = 0; kk < 8; ++kk) {
-                        simd<sycl::half, 2> p;
-                        p[0] = Kd[n][dd][2 * kk];
-                        p[1] = Kd[n][dd][2 * kk + 1];
-                        B.template bit_cast_view<uint32_t>()[kk * 16 + n] = p.template bit_cast_view<uint32_t>()[0];
+                    for (int dd = 0; dd < HALF / 16; ++dd) {
+                        Kd[n][dd] = block_load<sycl::half, 16>(kp + 16 * dd);
+                        Vd[n][dd] = block_load<sycl::half, 16>(vp + 16 * dd);
                     }
                 }
-                simd<float, MR * 16> C = xmx::dpas<8, MR, float, float, sycl::half, sycl::half>(
-                    simd<float, MR * 16>(0), B, A);
 #pragma unroll
                 for (int b = 0; b < BM; ++b) {
-                    S[b] += C.template select<16, 1>(16 * b);
+                    const int tok = tok0 + b < ntok ? tok0 + b : ntok - 1;
+                    const uint16_t * mrow = (const uint16_t *) (mask + (size_t) mask_stride * tok);
+                    simd<uint16_t, 16> mu = block_load<uint16_t, 16>(mrow + key);
+                    mk[b] = mu.template bit_cast_view<sycl::half>();
+                }
+#pragma unroll
+                for (int dd = 0; dd < HALF / 16; ++dd) {
+                    simd<sycl::half, MR * 16> A;
+#pragma unroll
+                    for (int b = 0; b < BM; ++b) {
+                        A.template select<16, 1>(16 * b) = Qd[b][dd];
+                    }
+                    simd<sycl::half, 256> B;
+#pragma unroll
+                    for (int n = 0; n < 16; ++n) {
+#pragma unroll
+                        for (int kk = 0; kk < 8; ++kk) {
+                            simd<sycl::half, 2> p;
+                            p[0] = Kd[n][dd][2 * kk];
+                            p[1] = Kd[n][dd][2 * kk + 1];
+                            B.template bit_cast_view<uint32_t>()[kk * 16 + n] = p.template bit_cast_view<uint32_t>()[0];
+                        }
+                    }
+                    simd<float, MR * 16> C = xmx::dpas<8, MR, float, float, sycl::half, sycl::half>(
+                        simd<float, MR * 16>(0), B, A);
+#pragma unroll
+                    for (int b = 0; b < BM; ++b) {
+                        S[b] += C.template select<16, 1>(16 * b);
+                    }
                 }
             }
-
-            simd<float, 16> P[BM];
 #pragma unroll
             for (int b = 0; b < BM; ++b) {
-                S[b] = S[b] * scale + convert<float>(mk[b]);
-                const float smax = hmax<float>(S[b]);
-                const float mnew = m[r][b] > smax ? m[r][b] : smax;
-                simd<float, 1> ea;
-                ea[0] = m[r][b] - mnew;
-                const float a = exp(ea)[0];
-                P[b]        = exp(S[b] - mnew);
-                lsum[r][b]  = lsum[r][b] * a + reduce<float>(P[b], std::plus<>());
-                m[r][b]     = mnew;
-                O[r][b] *= a;
+                slm_block_store<float, 16>((uint32_t) ((t * 2 + hd) * BM * 16 + b * 16) * 4, S[b]);
             }
-
+            barrier();
 #pragma unroll
-            for (int dd = 0; dd < HALF / 16; ++dd) {
-                simd<sycl::half, MR * 16> A;
+            for (int b = 0; b < BM; ++b) {
+                simd<float, 16> So = slm_block_load<float, 16>(
+                    (uint32_t) ((t * 2 + (hd ^ 1)) * BM * 16 + b * 16) * 4);
+                S[b] += So;
+            }
+            barrier();
+            if (live) {
+                simd<float, 16> P[BM];
 #pragma unroll
                 for (int b = 0; b < BM; ++b) {
-                    A.template select<16, 1>(16 * b) = convert<sycl::half>(P[b]);
-                }
-                simd<sycl::half, 256> B;
+                    S[b] = S[b] * scale + convert<float>(mk[b]);
 #pragma unroll
-                for (int n = 0; n < 16; ++n) {
-#pragma unroll
-                    for (int kk = 0; kk < 8; ++kk) {
-                        simd<sycl::half, 2> p;
-                        p[0] = Vd[n][dd][2 * kk];
-                        p[1] = Vd[n][dd][2 * kk + 1];
-                        B.template bit_cast_view<uint32_t>()[kk * 16 + n] = p.template bit_cast_view<uint32_t>()[0];
+                    for (int n = 0; n < 16; ++n) {
+                        if (key + n >= n_kv) {
+                            S[b][n] = -FLT_MAX / 2.0f;
+                        }
                     }
+                    const float smax = hmax<float>(S[b]);
+                    const float mnew = m[b] > smax ? m[b] : smax;
+                    simd<float, 1> ea;
+                    ea[0] = m[b] - mnew;
+                    const float a = exp(ea)[0];
+                    P[b]    = exp(S[b] - mnew);
+                    lsum[b] = lsum[b] * a + reduce<float>(P[b], std::plus<>());
+                    m[b]    = mnew;
+                    O[b] *= a;
                 }
-                simd<float, MR * 16> C = xmx::dpas<8, MR, float, float, sycl::half, sycl::half>(
-                    simd<float, MR * 16>(0), B, A);
 #pragma unroll
-                for (int b = 0; b < BM; ++b) {
-                    O[r][b].template select<16, 1>(16 * dd) += C.template select<16, 1>(16 * b);
+                for (int dd = 0; dd < HALF / 16; ++dd) {
+                    simd<sycl::half, MR * 16> A;
+#pragma unroll
+                    for (int b = 0; b < BM; ++b) {
+                        A.template select<16, 1>(16 * b) = convert<sycl::half>(P[b]);
+                    }
+                    simd<sycl::half, 256> B;
+#pragma unroll
+                    for (int n = 0; n < 16; ++n) {
+#pragma unroll
+                        for (int kk = 0; kk < 8; ++kk) {
+                            simd<sycl::half, 2> p;
+                            p[0] = Vd[n][dd][2 * kk];
+                            p[1] = Vd[n][dd][2 * kk + 1];
+                            B.template bit_cast_view<uint32_t>()[kk * 16 + n] = p.template bit_cast_view<uint32_t>()[0];
+                        }
+                    }
+                    simd<float, MR * 16> C = xmx::dpas<8, MR, float, float, sycl::half, sycl::half>(
+                        simd<float, MR * 16>(0), B, A);
+#pragma unroll
+                    for (int b = 0; b < BM; ++b) {
+                        O[b].template select<16, 1>(16 * dd) += C.template select<16, 1>(16 * b);
+                    }
                 }
             }
         }
     }
 
+    const int slot_base = hd * (T / 2);
 #pragma unroll
-    for (int r = 0; r < RQ; ++r) {
+    for (int s = T / 2; s >= 1; s >>= 1) {
+        if (t >= s && t < 2 * s) {
+            const uint32_t off = (uint32_t) (slot_base + (t - s)) * SLOT_F * 4;
+#pragma unroll
+            for (int b = 0; b < BM; ++b) {
+#pragma unroll
+                for (int q = 0; q < HALF / 32; ++q) {
+                    slm_block_store<float, 32>(off + (b * HALF + 32 * q) * 4, O[b].template select<32, 1>(32 * q));
+                }
+            }
+            simd<float, 2 * BM> ml;
+#pragma unroll
+            for (int b = 0; b < BM; ++b) {
+                ml[b]      = m[b];
+                ml[BM + b] = lsum[b];
+            }
+            slm_scatter<float, 2 * BM>(simd<uint32_t, 2 * BM>(off + BM * HALF * 4, 4), ml);
+        }
+        barrier();
+        if (t < s) {
+            const uint32_t      off = (uint32_t) (slot_base + t) * SLOT_F * 4;
+            simd<float, 2 * BM> ml  = slm_gather<float, 2 * BM>(simd<uint32_t, 2 * BM>(off + BM * HALF * 4, 4));
+#pragma unroll
+            for (int b = 0; b < BM; ++b) {
+                const float    mp   = ml[b];
+                const float    lp   = ml[BM + b];
+                const float    mnew = m[b] > mp ? m[b] : mp;
+                simd<float, 2> ea;
+                ea[0] = m[b] - mnew;
+                ea[1] = mp - mnew;
+                simd<float, 2> eav = exp(ea);
+                const float    a   = eav[0];
+                const float    ap  = eav[1];
+                lsum[b] = lsum[b] * a + lp * ap;
+                m[b]    = mnew;
+                O[b] *= a;
+#pragma unroll
+                for (int q = 0; q < HALF / 32; ++q) {
+                    simd<float, 32> op = slm_block_load<float, 32>(off + (b * HALF + 32 * q) * 4);
+                    O[b].template select<32, 1>(32 * q) += op * ap;
+                }
+            }
+        }
+        barrier();
+    }
+
+    if (t == 0) {
 #pragma unroll
         for (int b = 0; b < BM; ++b) {
             const int tok = tok0 + b;
             if (tok >= ntok) {
                 continue;
             }
-            const int hq = h * RQ + r;
             float * po = dst + ((size_t) tok * n_head + (size_t) hq) * D + hd * HALF;
-            const float inv = lsum[r][b] > 0.0f ? 1.0f / lsum[r][b] : 0.0f;
-            simd<float, HALF> out = O[r][b] * inv;
-            block_store<float, 64>(po, out.template select<64, 1>(0));
-            block_store<float, 64>(po + 64, out.template select<64, 1>(64));
+            const float inv = lsum[b] > 0.0f ? 1.0f / lsum[b] : 0.0f;
+            simd<float, HALF> outv = O[b] * inv;
+            block_store<float, 64>(po, outv.template select<64, 1>(0));
+            block_store<float, 64>(po + 64, outv.template select<64, 1>(64));
         }
     }
-    (void) o_base;
 }
 
 }  // namespace
@@ -560,8 +626,9 @@ void ggml_sycl_flash_attn_ext_esimd_prefill_f16(ggml_backend_sycl_context & ctx,
     const int gqa    = n_head / n_kvh;
     const int n_kv   = (int) K->ne[1];
     constexpr int BM = 8;
-    constexpr int RQ = 6;
-    if (gqa != RQ) {
+    constexpr int T  = 8;
+    constexpr int CH = 2;
+    if (gqa != 6) {
         GGML_ABORT("fattn f16 dpas: gqa!=6");
     }
     float scale = 1.0f;
@@ -610,7 +677,7 @@ void ggml_sycl_flash_attn_ext_esimd_prefill_f16(ggml_backend_sycl_context & ctx,
     stage_q4(V, Vf.get());
 
     const int n_tiles = (ntok + BM - 1) / BM;
-    const size_t wg   = 2;
+    const size_t wg   = (size_t) T * 2;
     const sycl::half * Qp = Qf.get();
     const sycl::half * Kp = Kf.get();
     const sycl::half * Vp = Vf.get();
@@ -618,10 +685,10 @@ void ggml_sycl_flash_attn_ext_esimd_prefill_f16(ggml_backend_sycl_context & ctx,
     const char *       Mp = (const char *) mask->data;
     const int          ms = (int) mask->nb[1];
     stream->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) n_kvh * n_tiles * wg), sycl::range<1>(wg)),
+        sycl::nd_range<1>(sycl::range<1>((size_t) n_head * n_tiles * wg), sycl::range<1>(wg)),
         sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
         [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-            fattn_prefill_f16_dpas<BM, RQ>(Qp, Kp, Vp, Mp, Dp, ms, n_kv, n_kvh, n_head, ntok, scale, it);
+            fattn_prefill_f16_dpas<BM, T, CH>(Qp, Kp, Vp, Mp, Dp, ms, n_kv, n_kvh, n_head, ntok, gqa, scale, it);
         });
 #else
     GGML_UNUSED(ctx);

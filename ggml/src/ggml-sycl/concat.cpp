@@ -175,7 +175,20 @@ void concat_impl_sycl(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
         const T * src1_d = (const T *) src1->data;
         T * dst_d = (T *) dst->data;
         size_t type_size = elem_size(dst->type);
-        if (dim != 3) {
+        if (dim == 1 && ggml_is_contiguous(dst)) {
+            const size_t row = (size_t) src0->ne[0] * type_size;
+            for (int i3 = 0; i3 < dst->ne[3]; ++i3) {
+                for (int i2 = 0; i2 < dst->ne[2]; ++i2) {
+                    T * d = dst_d + (size_t) ((i3 * dst->nb[3] + i2 * dst->nb[2]) / type_size);
+                    const T * a = src0_d + (size_t) ((i3 * src0->nb[3] + i2 * src0->nb[2]) / type_size);
+                    const T * b = src1_d + (size_t) ((i3 * src1->nb[3] + i2 * src1->nb[2]) / type_size);
+                    const size_t n0 = (size_t) src0->ne[1] * row;
+                    const size_t n1 = (size_t) src1->ne[1] * row;
+                    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(d, a, n0)));
+                    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy((char *) d + n0, b, n1)));
+                }
+            }
+        } else if (dim != 3) {
             for (int i3 = 0; i3 < dst->ne[3]; i3++) {
                 concat_T_sycl<T>(src0_d + i3 * (src0->nb[3] / type_size), src1_d + i3 * (src1->nb[3] / type_size),
                                 dst_d + i3 * (dst->nb[3] / type_size), src0->ne[0], src0->ne[1], src0->ne[2], dst->ne[0],
@@ -472,14 +485,42 @@ void ggml_sycl_concat_conv_tail(ggml_backend_sycl_context & ctx, ggml_tensor * d
     const int n_keep = ncs < 64 ? ncs : 64;
     const int tok0   = ncs - n_keep;
     const int n_c4   = C / 4;
-    const size_t total_work = static_cast<size_t>(n_c4) * static_cast<size_t>(n_s);
-    const size_t work_group_size = 256;
-    const size_t num_work_groups = (total_work + work_group_size - 1) / work_group_size;
     const float * state = static_cast<const float *>(st->data);
+    const int32_t * rows = nullptr;
+    int64_t row_stride    = 0;
+    if (!ggml_sycl_conv_state_gather(st, &state, &rows, &row_stride)) {
+        state      = static_cast<const float *>(st->data);
+        rows       = nullptr;
+        row_stride = 0;
+    }
     const float * xv    = static_cast<const float *>(x->data);
     float * out         = static_cast<float *>(dst->data);
     queue_ptr stream    = ctx.stream();
 
+    if (n_c4 > 0 && n_keep > 0 && (C % 4) == 0) {
+        const size_t nout = static_cast<size_t>(n_s) * static_cast<size_t>(C) * static_cast<size_t>(n_keep);
+        stream->parallel_for(sycl::range<1>(nout), [=](sycl::id<1> id) {
+            size_t idx = static_cast<size_t>(id[0]);
+            const int tlocal = static_cast<int>(idx % static_cast<size_t>(n_keep));
+            idx /= static_cast<size_t>(n_keep);
+            const int c = static_cast<int>(idx % static_cast<size_t>(C));
+            const int s = static_cast<int>(idx / static_cast<size_t>(C));
+            const int i = tok0 + tlocal;
+            const float * st_s = rows
+                ? state + (static_cast<size_t>(rows[s]) * static_cast<size_t>(row_stride))
+                : state + (static_cast<size_t>(s) * static_cast<size_t>(n_st) * static_cast<size_t>(C));
+            const float * x_s = xv + (static_cast<size_t>(s) * static_cast<size_t>(C) * static_cast<size_t>(n_t));
+            float * d_s = out + (static_cast<size_t>(s) * static_cast<size_t>(ncs) * static_cast<size_t>(C));
+            const float v = (i < n_st)
+                ? st_s[i + static_cast<size_t>(c) * static_cast<size_t>(n_st)]
+                : x_s[static_cast<size_t>(i - n_st) * static_cast<size_t>(C) + static_cast<size_t>(c)];
+            d_s[i + static_cast<size_t>(c) * static_cast<size_t>(ncs)] = v;
+        });
+        return;
+    }
+    const size_t total_work = static_cast<size_t>(n_c4) * static_cast<size_t>(n_s);
+    const size_t work_group_size = 256;
+    const size_t num_work_groups = (total_work + work_group_size - 1) / work_group_size;
     stream->parallel_for(
         sycl::nd_range<1>(sycl::range<1>(num_work_groups * work_group_size), sycl::range<1>(work_group_size)),
         [=](sycl::nd_item<1> item) {
@@ -490,7 +531,9 @@ void ggml_sycl_concat_conv_tail(ggml_backend_sycl_context & ctx, ggml_tensor * d
             const int c4 = static_cast<int>(idx % static_cast<size_t>(n_c4));
             const int s  = static_cast<int>(idx / static_cast<size_t>(n_c4));
             const int c  = c4 * 4;
-            const float * st_s = state + (static_cast<size_t>(s) * static_cast<size_t>(n_st) * static_cast<size_t>(C));
+            const float * st_s = rows
+                ? state + (static_cast<size_t>(rows[s]) * static_cast<size_t>(row_stride))
+                : state + (static_cast<size_t>(s) * static_cast<size_t>(n_st) * static_cast<size_t>(C));
             const float * x_s  = xv + (static_cast<size_t>(s) * static_cast<size_t>(C) * static_cast<size_t>(n_t));
             float * d_s        = out + (static_cast<size_t>(s) * static_cast<size_t>(ncs) * static_cast<size_t>(C));
             for (int i = tok0; i < ncs; ++i) {

@@ -381,6 +381,40 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
     }
 }
 
+void quantize_row_xe2mx4_ref(const float * GGML_RESTRICT x, block_xe2mx4 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_XE2MX4;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i * qk + j];
+            if (amax < fabsf(v)) {
+                amax = fabsf(v);
+            }
+        }
+
+        const float d  = amax / 8.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        for (int j = 0; j < qk / 2; ++j) {
+            const float x0 = x[i * qk + 2 * j + 0] * id;
+            const float x1 = x[i * qk + 2 * j + 1] * id;
+            int q0 = (int) nearbyintf(x0);
+            int q1 = (int) nearbyintf(x1);
+            if (q0 < -8) q0 = -8;
+            if (q0 >  7) q0 = 7;
+            if (q1 < -8) q1 = -8;
+            if (q1 >  7) q1 = 7;
+            y[i].qs[j] = (uint8_t) (q0 + 8) | ((uint8_t) (q1 + 8) << 4);
+        }
+    }
+}
+
 void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_NVFP4;
     static const int qk_sub = QK_NVFP4_SUB;
@@ -607,6 +641,24 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
                 yb[j + 0       ] = v0*d;
                 yb[j + qk_sub/2] = v1*d;
             }
+        }
+    }
+}
+
+void dequantize_row_xe2mx4(const block_xe2mx4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_XE2MX4;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < qk / 2; ++j) {
+            const int x0 = (x[i].qs[j] & 0x0F) - 8;
+            const int x1 = (x[i].qs[j] >> 4) - 8;
+            y[i * qk + 2 * j + 0] = x0 * d;
+            y[i * qk + 2 * j + 1] = x1 * d;
         }
     }
 }
@@ -2309,6 +2361,41 @@ size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     GGML_UNUSED(quant_weights);
     quantize_row_nvfp4_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_NVFP4, n_per_row);
+}
+
+size_t quantize_xe2mx4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    size_t row_size = ggml_row_size(GGML_TYPE_XE2MX4, n_per_row);
+    char * qrow = (char *) dst;
+    int8_t L[QK_XE2MX4];
+    float weight[QK_XE2MX4];
+    for (int64_t row = 0; row < nrow; ++row) {
+        float sum_x2 = 0;
+        for (int64_t j = 0; j < n_per_row; ++j) {
+            sum_x2 += src[j] * src[j];
+        }
+        const float sigma2 = sum_x2 / (float) n_per_row;
+        const int64_t nb = n_per_row / QK_XE2MX4;
+        block_xe2mx4 * y = (block_xe2mx4 *) qrow;
+        for (int64_t ib = 0; ib < nb; ++ib) {
+            const float * xb = src + QK_XE2MX4 * ib;
+            const float * wptr = NULL;
+            if (quant_weights) {
+                const float * qw = quant_weights + QK_XE2MX4 * ib;
+                for (int j = 0; j < QK_XE2MX4; ++j) {
+                    weight[j] = qw[j] * sqrtf(sigma2 + xb[j] * xb[j]);
+                }
+                wptr = weight;
+            }
+            const float d = make_qx_quants(QK_XE2MX4, 8, xb, L, 1, wptr);
+            y[ib].d = GGML_FP32_TO_FP16(d);
+            for (int j = 0; j < QK_XE2MX4 / 2; ++j) {
+                y[ib].qs[j] = (uint8_t) L[2 * j] | ((uint8_t) L[2 * j + 1] << 4);
+            }
+        }
+        src += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
 }
 
 // ====================== Ternary (de)-quantization (BitNet b1.58 and TriLMs)
@@ -5563,9 +5650,12 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             } break;
         case GGML_TYPE_NVFP4:
             {
-                // UE4M3 scales are uint8_t — all byte values are valid
                 GGML_UNUSED(data);
                 GGML_UNUSED(nb);
+            } break;
+        case GGML_TYPE_XE2MX4:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_xe2mx4, data, nb);
             } break;
         case GGML_TYPE_Q2_K:
             {

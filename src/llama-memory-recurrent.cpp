@@ -690,6 +690,46 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             }
         }
 
+        // seq_rm clears cell metadata but not the tensor. A reused slot otherwise copies
+        // the previous request's recurrent row. Zero the fresh-sequence source row only.
+        bool need_zero = false;
+        for (int i = min; i <= max; ++i) {
+            if (cells[i].src < 0) {
+                need_zero = true;
+                break;
+            }
+        }
+        if (need_zero && rs_z >= 0 && n_seq_tokens > 1) {
+            auto zap = [&](ggml_tensor * t, int32_t row) {
+                if (!t || row < 0 || row >= t->ne[1] || t->nb[1] == 0) {
+                    return;
+                }
+                std::vector<uint8_t> z(t->nb[1], 0);
+                ggml_backend_tensor_set(t, z.data(), (size_t) row * t->nb[1], t->nb[1]);
+            };
+            auto zero_row = [&](int32_t row) {
+                for (ggml_tensor * t : r_l) zap(t, row);
+                for (ggml_tensor * t : s_l) zap(t, row);
+                for (ggml_tensor * t : p_l) zap(t, row);
+            };
+            zero_row(rs_z);
+            if (n_rs_seq != 0) {
+                for (int i = min; i <= max; ++i) {
+                    if (cells[i].src >= 0 || cells[i].seq_id.empty()) {
+                        continue;
+                    }
+                    const llama_seq_id seq = *cells[i].seq_id.begin();
+                    if (seq < 0 || (size_t) seq >= rs_idx.size()) {
+                        continue;
+                    }
+                    const int32_t row = (int32_t) (rs_idx[seq] * size) + rs_z;
+                    if (row != rs_z) {
+                        zero_row(row);
+                    }
+                }
+            }
+        }
+
         for (int i = min; i <= max; ++i) {
             if (cells[i].src < 0) {
                 GGML_ASSERT(rs_z >= 0);

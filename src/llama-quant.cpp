@@ -4,6 +4,10 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#ifdef GGML_USE_SYCL
+#include "ggml-sycl.h"
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -398,6 +402,7 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
+            case GGML_TYPE_XE2MX4:  return_type = GGML_TYPE_Q8_0;   break;
             default:
                 if (qk_k <= 32) {
                     // the target is already a 32-block type, so there is no smaller block to demote to
@@ -463,6 +468,9 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE) {
                 new_type = GGML_TYPE_Q8_0;
             }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_XE2MX4) {
+                new_type = GGML_TYPE_Q8_0;
+            }
             else if (arch == LLM_ARCH_FALCON || nx % qk_k != 0) {
                 new_type = GGML_TYPE_Q8_0;
             }
@@ -504,6 +512,9 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_Q2_0) {
                 new_type = GGML_TYPE_Q4_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_XE2MX4) {
+                new_type = GGML_TYPE_Q8_0;
             }
         }
     } else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S ||
@@ -856,6 +867,8 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_ALL_F32:     return GGML_TYPE_F32;
         case LLAMA_FTYPE_MOSTLY_Q1_0: return GGML_TYPE_Q1_0;
         case LLAMA_FTYPE_MOSTLY_Q2_0: return GGML_TYPE_Q2_0;
+
+        case LLAMA_FTYPE_MOSTLY_XE2MX4: return GGML_TYPE_XE2MX4;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
 
@@ -1283,20 +1296,60 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const size_t row_size_src = ggml_row_size(tensor->type, n_per_row);
                 const size_t row_size_dst = ggml_row_size(new_type,     n_per_row);
 
-                // process the rows in slabs, so that the buffers stay below max_buf_size
-                const size_t bytes_per_row = row_size_src + row_size_dst + (tensor->type == GGML_TYPE_F32 ? 0 : n_per_row*sizeof(float));
+#ifdef GGML_USE_SYCL
+                // quantized sources (requant, e.g. IQ4_XS) are expanded to F32 on the host, then packed on the Xe2 GPU
+                const bool xe2mx_src_raw = tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16;
+                const bool xe2mx_gpu = new_type == GGML_TYPE_XE2MX4 &&
+                    (xe2mx_src_raw || ggml_is_quantized(tensor->type)) &&
+                    (n_per_row % ggml_blck_size(GGML_TYPE_XE2MX4) == 0) &&
+                    tensor->ne[2] == 1 && tensor->ne[3] == 1;
+                const bool xe2mx_gpu_deq = xe2mx_gpu && !xe2mx_src_raw;
+#else
+                const bool xe2mx_gpu = false;
+                const bool xe2mx_gpu_deq = false;
+#endif
+
+                const size_t bytes_per_row = row_size_src + row_size_dst + ((tensor->type == GGML_TYPE_F32 || (xe2mx_gpu && !xe2mx_gpu_deq)) ? 0 : n_per_row*sizeof(float));
                 const int64_t nrows_slab = std::max<int64_t>(1, std::min<int64_t>(nrows_total, max_buf_size/bytes_per_row));
 
                 static const int64_t min_chunk_size = 32 * 512;
                 const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
 
-                // process rows across all experts in one pass to keep all threads busy
                 new_size = 0;
                 for (int64_t ir = 0; ir < nrows_total; ir += nrows_slab) {
                     const int64_t nrows_cur = std::min(nrows_slab, nrows_total - ir);
                     const int64_t nelements_cur = nrows_cur * n_per_row;
 
                     const void * src = load_range(ir*row_size_src, nrows_cur*row_size_src);
+
+                    if (work.size() < nrows_cur*row_size_dst) {
+                        work.resize(nrows_cur*row_size_dst);
+                    }
+
+#ifdef GGML_USE_SYCL
+                    if (xe2mx_gpu) {
+                        const void * gsrc = src;
+                        ggml_type gtype = tensor->type;
+                        if (xe2mx_gpu_deq) {
+                            if (f32_conv_buf.size() < (size_t) nelements_cur) {
+                                f32_conv_buf.resize(nelements_cur);
+                            }
+                            llama_tensor_dequantize_impl(tensor->type, src, (float *) f32_conv_buf.data(), workers, nelements_cur, nthread);
+                            gsrc = f32_conv_buf.data();
+                            gtype = GGML_TYPE_F32;
+                        }
+                        const size_t size_cur = ggml_sycl_quantize_xe2mx4(gsrc, gtype, work.data(), nrows_cur, n_per_row, imatrix);
+                        if (size_cur == 0) {
+                            throw std::runtime_error(format("XE2MX4 SYCL quantize failed for %s (needs an Xe2 SYCL GPU)", tensor->name));
+                        }
+                        if (!ggml_validate_row_data(new_type, work.data(), size_cur)) {
+                            throw std::runtime_error(format("invalid XE2MX4 data in %s", tensor->name));
+                        }
+                        fout.write((const char *) work.data(), size_cur);
+                        new_size += size_cur;
+                        continue;
+                    }
+#endif
 
                     const float * f32_data;
                     if (tensor->type == GGML_TYPE_F32) {
@@ -1307,10 +1360,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         }
                         llama_tensor_dequantize_impl(tensor->type, src, (float *) f32_conv_buf.data(), workers, nelements_cur, nthread);
                         f32_data = (const float *) f32_conv_buf.data();
-                    }
-
-                    if (work.size() < nrows_cur*row_size_dst) {
-                        work.resize(nrows_cur*row_size_dst);
                     }
 
                     const int64_t nchunk = (nelements_cur + chunk_size - 1)/chunk_size;

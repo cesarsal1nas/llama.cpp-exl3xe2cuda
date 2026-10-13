@@ -29,6 +29,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -469,6 +470,27 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        // Nextn draft layers do not divide across devices. Keep them whole.
+        if (tensor_name.rfind("blk.", 0) == 0 || tensor_name.rfind("cache_", 0) == 0) {
+            uint32_t il_mtp = 0;
+            bool have_il = false;
+            if (tensor_name.rfind("blk.", 0) == 0) {
+                const size_t dot = tensor_name.find('.', 4);
+                if (dot != std::string::npos) {
+                    il_mtp = std::stoull(tensor_name.substr(4, dot - 4));
+                    have_il = true;
+                }
+            } else {
+                const size_t layer_index_start = tensor_name.find("_l");
+                if (layer_index_start != std::string::npos) {
+                    il_mtp = std::stoull(tensor_name.substr(layer_index_start + 2));
+                    have_il = true;
+                }
+            }
+            if (have_il && il_mtp >= hparams.n_layer()) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+        }
         if (is_dsv4) {
             if (std::regex_match(tensor_name, pattern_kv_cache) ||
                     std::regex_match(tensor_name, pattern_dsv4_state)) {
@@ -1473,6 +1495,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
         __func__, load_mode_name);
 
+    {
+        const int kid_lo = gguf_find_key(ml.metadata, "xe2mx.lo");
+        if (kid_lo >= 0) {
+            setenv("GGML_SYCL_XE2MX_LO", "1", 0);
+            LLAMA_LOG_INFO("%s: xe2mx LO contract (xe2mx.lo)\n", __func__);
+        }
+    }
+
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
     for (const auto & dev : devices) {
@@ -1929,6 +1959,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             return false;
         }
     }
+
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {

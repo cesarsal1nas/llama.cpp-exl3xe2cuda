@@ -16,5 +16,6 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
 
 bool ggml_sycl_is_gdn_conv_concat(const ggml_tensor * concat);
 bool ggml_sycl_ssm_conv_can_split(const ggml_tensor * ssm);
+bool ggml_sycl_conv_state_gather(const ggml_tensor * st, const float ** data, const int32_t ** rows, int64_t * stride);
 
 #endif  // GGML_SYCL_FUSION_HPP

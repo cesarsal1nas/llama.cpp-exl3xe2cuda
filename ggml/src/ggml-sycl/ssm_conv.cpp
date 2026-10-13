@@ -2,8 +2,10 @@
 #include "concat.hpp"
 #include "fusion.hpp"
 #include "common.hpp"
+#include "norm.hpp"
 
 #include <cstdio>
+#include <cstring>
 
 using namespace sycl;
 
@@ -53,7 +55,11 @@ static void kernel_ssm_conv_split(
     int n_t,
     int n_s) {
     constexpr int VEC = 4;
-    constexpr int TOK = 64;
+    int tok = ggml_sycl_get_env("GGML_SYCL_SSM_TOK", 0);
+    if (tok != 32 && tok != 128) {
+        tok = 64;
+    }
+    const int TOK     = tok;
     const int n_c4    = C / VEC;
     const int n_tb    = (n_t + TOK - 1) / TOK;
     const size_t total_work = static_cast<size_t>(n_c4) * static_cast<size_t>(n_tb) * static_cast<size_t>(n_s);
@@ -257,7 +263,42 @@ void ggml_sycl_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml
 
 static ggml_tensor * g_conv_concat_done_ssm[96];
 static ggml_tensor * g_conv_concat_done_silu[96];
+static ggml_tensor * g_conv_concat_done_cpy[192];
 static int g_conv_concat_done_n = 0;
+static int g_conv_concat_done_cpy_n = 0;
+
+static void kernel_conv_state_from_split(
+        queue & q,
+        const float * state,
+        const float * x,
+        float * dest,
+        int n_st,
+        int C,
+        int n_t,
+        int n_s,
+        int col0,
+        int dest_seq) {
+    const size_t nout = static_cast<size_t>(n_s) * static_cast<size_t>(C) * static_cast<size_t>(n_st);
+    q.parallel_for(range<1>(nout), [=](id<1> id) {
+        size_t idx = static_cast<size_t>(id[0]);
+        const int i = static_cast<int>(idx % static_cast<size_t>(n_st));
+        idx /= static_cast<size_t>(n_st);
+        const int c = static_cast<int>(idx % static_cast<size_t>(C));
+        const int s = static_cast<int>(idx / static_cast<size_t>(C));
+        const int logical = col0 + i;
+        float v;
+        if (logical < n_st) {
+            v = state[static_cast<size_t>(s) * static_cast<size_t>(n_st) * static_cast<size_t>(C) +
+                      static_cast<size_t>(logical) + static_cast<size_t>(c) * static_cast<size_t>(n_st)];
+        } else {
+            const int t = logical - n_st;
+            v = x[static_cast<size_t>(s) * static_cast<size_t>(C) * static_cast<size_t>(n_t) +
+                  static_cast<size_t>(t) * static_cast<size_t>(C) + static_cast<size_t>(c)];
+        }
+        dest[static_cast<size_t>(s) * static_cast<size_t>(dest_seq) + static_cast<size_t>(i) +
+             static_cast<size_t>(c) * static_cast<size_t>(n_st)] = v;
+    });
+}
 
 bool ggml_sycl_try_conv_concat_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * concat = cgraph->nodes[node_idx];
@@ -282,8 +323,130 @@ bool ggml_sycl_try_conv_concat_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph
         ggml_sycl_can_fuse(cgraph, ssm_idx, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         silu = cgraph->nodes[ssm_idx + 1];
     }
-    ggml_sycl_concat_conv_tail(ctx, concat);
+    const int nocat = ggml_sycl_get_env("GGML_SYCL_XE2MX_CONV_NOCAT", 0);
+    ggml_tensor * cpy_hit[8];
+    int cpy_col[8];
+    int n_cpy = 0;
+    bool cpy_ok = true;
+    if (nocat) {
+        const ggml_tensor * st = concat->src[0];
+        const ggml_tensor * x  = concat->src[1];
+        const int n_st = static_cast<int>(st->ne[0]);
+        const int C    = static_cast<int>(st->ne[1]);
+        const int n_t  = static_cast<int>(x->ne[0]);
+        const int n_s  = static_cast<int>(st->ne[2]);
+        const int ncs  = n_st + n_t;
+        for (int j = node_idx + 1; j < cgraph->n_nodes && cpy_ok; ++j) {
+            ggml_tensor * n = cgraph->nodes[j];
+            if (!n || n->op != GGML_OP_CPY || !n->src[0] || !n->src[1]) {
+                continue;
+            }
+            if (n->src[0]->view_src != concat || n->src[0]->op != GGML_OP_VIEW) {
+                continue;
+            }
+            if (n->src[0]->type != GGML_TYPE_F32 || n->src[1]->type != GGML_TYPE_F32) {
+                cpy_ok = false;
+                break;
+            }
+            if (n->src[0]->ne[0] != n_st || n->src[0]->ne[1] != C || n->src[0]->ne[2] != n_s) {
+                cpy_ok = false;
+                break;
+            }
+            if ((n->src[0]->view_offs % sizeof(float)) != 0) {
+                cpy_ok = false;
+                break;
+            }
+            const int col0 = static_cast<int>(n->src[0]->view_offs / sizeof(float));
+            if (col0 < 0 || col0 + n_st > ncs) {
+                cpy_ok = false;
+                break;
+            }
+            if (!n->src[1]->data || n->src[1]->nb[0] != sizeof(float) ||
+                ggml_nelements(n->src[1]) != (int64_t) n_st * C * n_s) {
+                cpy_ok = false;
+                break;
+            }
+            const int dest_seq = n_s > 1 ? static_cast<int>(n->src[1]->nb[1] / sizeof(float)) : n_st * C;
+            if (dest_seq < n_st * C) {
+                cpy_ok = false;
+                break;
+            }
+            if (n_cpy >= 8) {
+                cpy_ok = false;
+                break;
+            }
+            cpy_hit[n_cpy] = n;
+            cpy_col[n_cpy] = col0;
+            n_cpy++;
+            (void) dest_seq;
+        }
+        if (!cpy_ok) {
+            n_cpy = 0;
+        }
+    }
+    if (!(nocat && cpy_ok)) {
+        ggml_sycl_concat_conv_tail(ctx, concat);
+    } else if (n_cpy > 0) {
+        const ggml_tensor * st = concat->src[0];
+        const ggml_tensor * x  = concat->src[1];
+        const int n_st = static_cast<int>(st->ne[0]);
+        const int C    = static_cast<int>(st->ne[1]);
+        const int n_t  = static_cast<int>(x->ne[0]);
+        const int n_s  = static_cast<int>(st->ne[2]);
+        queue_ptr stream = ctx.stream();
+        for (int k = 0; k < n_cpy; ++k) {
+            const int dest_seq = n_s > 1 ? static_cast<int>(cpy_hit[k]->src[1]->nb[1] / sizeof(float)) : n_st * C;
+            kernel_conv_state_from_split(
+                *stream, static_cast<const float *>(st->data), static_cast<const float *>(x->data),
+                static_cast<float *>(cpy_hit[k]->src[1]->data), n_st, C, n_t, n_s, cpy_col[k], dest_seq);
+            if (g_conv_concat_done_cpy_n < 192) {
+                g_conv_concat_done_cpy[g_conv_concat_done_cpy_n++] = cpy_hit[k];
+            }
+        }
+    }
     ggml_sycl_ssm_conv(ctx, ssm, silu);
+    if (silu && ggml_sycl_get_env("GGML_SYCL_FUSE_CONV_L2", 0) && ggml_is_contiguous(silu) &&
+        silu->type == GGML_TYPE_F32) {
+        ggml_tensor * l2q = nullptr;
+        ggml_tensor * l2k = nullptr;
+        for (int j = ssm_idx + 1; j < cgraph->n_nodes && j < ssm_idx + 48; ++j) {
+            ggml_tensor * n = cgraph->nodes[j];
+            if (!n || n->op != GGML_OP_L2_NORM || !n->src[0] || n->src[0]->ne[0] != 128) {
+                continue;
+            }
+            const ggml_tensor * v = n->src[0];
+            while (v && (v->op == GGML_OP_VIEW || v->op == GGML_OP_RESHAPE || v->op == GGML_OP_PERMUTE ||
+                         v->op == GGML_OP_TRANSPOSE)) {
+                if (v->view_src == silu) {
+                    break;
+                }
+                v = v->view_src ? v->view_src : v->src[0];
+            }
+            if (!v || v->view_src != silu) {
+                continue;
+            }
+            if (!l2q) {
+                l2q = n;
+            } else if (!l2k) {
+                l2k = n;
+                break;
+            }
+        }
+        if (l2q && l2k && l2q->src[0]->ne[1] == l2k->src[0]->ne[1] &&
+            l2q->src[0]->ne[0] == 128 && ggml_is_contiguous_rows(l2q->src[0]) &&
+            ggml_is_contiguous_rows(l2k->src[0]) && l2q->data && l2k->data) {
+            ggml_sycl_op_l2_norm(ctx, l2q);
+            ggml_sycl_op_l2_norm(ctx, l2k);
+            static int ncl2 = 0;
+            if (ncl2 < 4) {
+                ncl2++;
+                GGML_SYCL_XE2_LOG( "xe2mx conv-l2 hit C=%ld nt=%ld heads=%ld\n",
+                        (long) silu->ne[0], (long) silu->ne[1],
+                        (long) (l2q->src[0]->ne[1] + l2k->src[0]->ne[1]));
+                fflush(stderr);
+            }
+        }
+    }
     if (g_conv_concat_done_n < 96) {
         g_conv_concat_done_ssm[g_conv_concat_done_n]  = ssm;
         g_conv_concat_done_silu[g_conv_concat_done_n] = silu;
@@ -294,6 +457,18 @@ bool ggml_sycl_try_conv_concat_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph
 
 void ggml_sycl_conv_concat_fuse_begin(void) {
     g_conv_concat_done_n = 0;
+    g_conv_concat_done_cpy_n = 0;
+}
+
+int ggml_sycl_conv_cpy_skip_done(const ggml_tensor * node) {
+    for (int k = 0; k < g_conv_concat_done_cpy_n; ++k) {
+        if (node != g_conv_concat_done_cpy[k]) {
+            continue;
+        }
+        g_conv_concat_done_cpy[k] = nullptr;
+        return 1;
+    }
+    return 0;
 }
 
 int ggml_sycl_ssm_conv_skip_done(ggml_cgraph * cgraph, int node_idx) {

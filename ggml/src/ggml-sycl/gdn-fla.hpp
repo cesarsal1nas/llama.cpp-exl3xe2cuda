@@ -58,8 +58,11 @@ static void gdn_fla_solve_T(const float * akk, const float * g, const float * be
     const int     nC  = (int) sycl::min((int64_t) BT, n_tokens - (int64_t) t0);
 
     const float * Ak = akk + (size_t) b * (size_t) (BT * BT);
+    // oneDNN DnnlGemmWrapper C strides {m*n, 1, m} = column-major (m,n)
     for (int p = tid; p < BT * BT; p += 32) {
-        aslm[p] = Ak[p];
+        const int i = p % BT;
+        const int j = p / BT;
+        aslm[i * BT + j] = Ak[i + j * BT]; // CM -> RM
     }
     if (tid < BT) {
         if (tid < nC) {
@@ -83,22 +86,19 @@ static void gdn_fla_solve_T(const float * akk, const float * g, const float * be
                 if (i <= j) {
                     aslm[i * BT + j] = 0.f;
                 } else {
-                    aslm[i * BT + j] *= bslm[j] * gdn_fla_exp_clamp(gslm[j] - gslm[i]);
+                    // FLA A: i>j : (k_i.k_j) * beta[i] * exp(g[i]-g[j])
+                    aslm[i * BT + j] *= bslm[i] * gdn_fla_exp_clamp(gslm[i] - gslm[j]);
                 }
             }
         }
-        for (int i = 0; i < BT; ++i) {
-            for (int j = 0; j < BT; ++j) {
-                tslm[i * BT + j] = (i == j) ? 1.f : 0.f;
-            }
-        }
-        for (int i = 1; i < BT; ++i) {
-            for (int j = 0; j < i; ++j) {
-                float acc2 = aslm[i * BT + j];
-                for (int kk = j + 1; kk < i; ++kk) {
-                    acc2 += aslm[i * BT + kk] * tslm[kk * BT + j];
+        // Ai = (I+A)^{-1} via forward substitution (unit diagonal)
+        for (int j = 0; j < BT; ++j) {
+            for (int i = 0; i < BT; ++i) {
+                float sum = (i == j) ? 1.f : 0.f;
+                for (int kk = 0; kk < i; ++kk) {
+                    sum -= aslm[i * BT + kk] * tslm[kk * BT + j];
                 }
-                tslm[i * BT + j] = -acc2;
+                tslm[i * BT + j] = sum;
             }
         }
     }
@@ -129,8 +129,13 @@ static void gdn_fla_scan(const float * q, const float * k, const float * v, cons
     if (col >= D) {
         return;
     }
-    constexpr int warp_size     = 16;
+    // Must match launch block_dims x = physical warp and reqd_sub_group_size(WARP_SIZE)
+    constexpr int warp_size     = WARP_SIZE;
     constexpr int rows_per_lane = D / warp_size;
+    static_assert(D % WARP_SIZE == 0, "D must divide WARP_SIZE");
+    if (lane >= warp_size) {
+        return;
+    }
     const uint32_t iq1          = fastmodulo(h, neqk1_magic);
     const uint32_t iq3          = fastdiv(seq, rq3_magic);
     const int64_t packed        = H * D * D;
@@ -188,38 +193,43 @@ static void gdn_fla_scan(const float * q, const float * k, const float * v, cons
         }
         it.barrier(sycl::access::fence_space::local_space);
 
-        float kS[BT];
-        for (int j = 0; j < BT; ++j) {
-            float         sh = 0.f;
-            const float * kj = kslm + j * D;
-#pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                sh += s_shard[r] * kj[r * warp_size + lane];
-            }
-            kS[j] = bslm[j] * gdn_fla_exp_clamp(gslm[j]) * warp_reduce_sum<warp_size>(sh);
-        }
-
-        float Utilde[BT];
+        // h0 = s_shard at chunk start (already in s_shard)
+        // w_key[j] contribution: Ai @ (k * beta * exp g); u: Ai @ (v * beta)
+        // vnew[i] = u[i] - w[i].h0  for this col
+        float vnew[BT];
         for (int i = 0; i < BT; ++i) {
-            float U = 0.f;
-            float P = 0.f;
+            float uu = 0.f;
+            float ww_dot = 0.f;
             for (int j = 0; j < BT; ++j) {
-                const float Tji = Tslm[j * BT + i];
-                U += vslm[j * D + col] * bslm[j] * Tji;
-                P += Tji * kS[j];
+                const float Aij = Tslm[i * BT + j]; // Ai[i,j]
+                uu += Aij * vslm[j * D + col] * bslm[j];
+                // w[i] . h0 for this col: sum_key Ai[i,j] * k[j,key] * b[j] * exp(g[j]) * h0[col,key]
             }
-            Utilde[i] = U - P;
+            // compute w.h0 via warp: for each j, (h0.k_j) * scale
+            float wh = 0.f;
+            for (int j = 0; j < BT; ++j) {
+                float sh = 0.f;
+                const float * kj = kslm + j * D;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    sh += s_shard[r] * kj[r * warp_size + lane];
+                }
+                sh = warp_reduce_sum<warp_size>(sh);
+                const float Aij = Tslm[i * BT + j];
+                wh += Aij * bslm[j] * gdn_fla_exp_clamp(gslm[j]) * sh;
+            }
+            vnew[i] = uu - wh;
         }
 
+        // o: inter = (q.h0)*exp(g); intra = tril(q.k * exp(gi-gj)) @ vnew
         for (int i = 0; i < nC; ++i) {
             float         inter = 0.f;
             const float * qi    = qslm + i * D;
-            const float   gi    = gdn_fla_exp_clamp(gslm[i]);
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 inter += s_shard[r] * qi[r * warp_size + lane];
             }
-            inter = gi * warp_reduce_sum<warp_size>(inter);
+            inter = gdn_fla_exp_clamp(gslm[i]) * warp_reduce_sum<warp_size>(inter);
             float intra = 0.f;
             for (int j = 0; j <= i; ++j) {
                 float         dot = 0.f;
@@ -229,23 +239,22 @@ static void gdn_fla_scan(const float * q, const float * k, const float * v, cons
                     dot += kj[r * warp_size + lane] * qi[r * warp_size + lane];
                 }
                 dot = warp_reduce_sum<warp_size>(dot);
-                intra += dot * gdn_fla_exp_clamp(gslm[j] - gslm[i]) * Utilde[j];
+                // FLA: exp(g_i - g_j) * vnew[j]
+                intra += dot * gdn_fla_exp_clamp(gslm[i] - gslm[j]) * vnew[j];
             }
             if (lane == 0) {
                 attn_data[(t0 + i) * (int) H * D + col] = (inter + intra) * scale;
             }
-            if constexpr (keep_rs_t) {
-                // per-token state only on last chunk (Kst snapshots of the tail)
-            }
         }
 
+        // state: h = exp(g_last)*h0 + sum_i k[i] outer (vnew[i]*exp(g_last-g_i))
         const float Glast = gdn_fla_exp_clamp(gslm[nC - 1]);
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             s_shard[r] *= Glast;
             const int key = r * warp_size + lane;
             for (int i = 0; i < nC; ++i) {
-                s_shard[r] += kslm[i * D + key] * Utilde[i] * gdn_fla_exp_clamp(gslm[nC - 1] - gslm[i]);
+                s_shard[r] += kslm[i * D + key] * vnew[i] * gdn_fla_exp_clamp(gslm[nC - 1] - gslm[i]);
             }
         }
         if constexpr (keep_rs_t) {
@@ -375,10 +384,11 @@ static bool gdn_fla_try_launch(ggml_backend_sycl_context & ctx, const float * q_
                          });
     });
 
-    const int warp_size = ggml_sycl_info().devices[ggml_sycl_get_device()].warp_size;
+    const int warp_size = ggml_sycl_get_physical_warp_size();
     const int num_warps = 4;
+    // x = lane (warp), y = warp id within block -> col = group0*num_warps + local_y
     dpct::dim3 grid_dims((unsigned) H, (unsigned) n_seqs, (unsigned) ((D + num_warps - 1) / num_warps));
-    dpct::dim3 block_dims((unsigned) (warp_size <= D ? warp_size : D), (unsigned) num_warps, 1);
+    dpct::dim3 block_dims((unsigned) warp_size, (unsigned) num_warps, 1);
     // nd_range<3> in this tree is (z,y,x) ~ (H, n_seqs, col_groups) matching COL2/chunk32
     stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<float, 1> kslm(sycl::range<1>(BT * D), cgh);

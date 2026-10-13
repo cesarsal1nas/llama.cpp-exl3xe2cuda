@@ -79,6 +79,8 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
+bool common_speculative_keeps_draft_kv(const common_speculative * spec);
+
 // optional: target samples for this verify batch (accepted drafts + bonus).
 // Lets draft-mtp fuse process() catch-up with draft-0 when the target samples
 // on the CPU after decode.

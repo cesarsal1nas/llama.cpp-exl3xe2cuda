@@ -236,6 +236,15 @@ typedef struct {
 } block_mxfp4;
 static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
 
+#define QK_XE2MX4 32
+#define QR_XE2MX4 1
+#define QI_XE2MX4 (QK_XE2MX4 / (4 * QR_XE2MX4))
+typedef struct {
+    ggml_half d;
+    uint8_t qs[QK_XE2MX4 / 2];
+} block_xe2mx4;
+static_assert(sizeof(block_xe2mx4) == sizeof(ggml_half) + QK_XE2MX4 / 2, "wrong xe2mx4 block size/padding");
+
 #define QK_NVFP4 64
 #define QK_NVFP4_SUB 16  // sub-block size for per-group scales
 typedef struct {

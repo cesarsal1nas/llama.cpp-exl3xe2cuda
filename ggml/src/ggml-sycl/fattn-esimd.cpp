@@ -1,3 +1,4 @@
+#include <chrono>
 #include "fattn-esimd.hpp"
 #include "fattn-common.hpp"
 
@@ -48,7 +49,7 @@ ESIMD_INLINE void fattn_dec_q4_0(const int8_t * Q8, const float * Qc, const uint
                                  const int v_head_b, const int mask_stride, const int n_kv, const int n_kvh,
                                  const int n_head, const int nsplit, const int ntok_all, const sycl::nd_item<1> & it) {
     constexpr int KEYS_WG = T * CH * 16;
-    constexpr int MR      = 8;  // dpas repeat count: query rows padded to 8
+    constexpr int MR      = RQ;  // exact DPAS row count; Qwen GQA=6 no longer burns two padded XMX rows
     constexpr int HALF    = 128;
     constexpr int SLOT_F  = RQ * HALF + 2 * RQ;  // floats per SLM slot: O half, m[RQ], l[RQ]
     constexpr int NSLOT   = (T / 2 > 0 ? T / 2 : 1) * 2 * NTOK;
@@ -69,7 +70,8 @@ ESIMD_INLINE void fattn_dec_q4_0(const int8_t * Q8, const float * Qc, const uint
     const int hd    = (l / T) & 1;
     const int tok   = tile * NTOK + l / (2 * T);
     const int tok_q = tok < ntok_all ? tok : ntok_all - 1;
-    const int nwalk = KWALK ? ((n_kv + KEYS_WG - 1) / KEYS_WG) : 1;
+    const int nsl   = (n_kv + KEYS_WG - 1) / KEYS_WG;
+    const int nwalk = KWALK ? ((nsl + nsplit - 1) / nsplit) : 1;
 
     // ---- Q rows, pre-quantized to q8 by fattn_q8_prepass: Q8[tok][head][256], Qc[tok][head][16] = {d[8], -8*d*sum(q8)[8]}
     simd<int, 64>   Qd[RQ];
@@ -382,9 +384,23 @@ ESIMD_INLINE void fattn_dec_q4_0(const int8_t * Q8, const float * Qc, const uint
         }
     };
 
+    // ---- XMX main loop, lean: one block live at a time (two live blocks spill once the walk loop is runtime).
+    if constexpr (XMX && XV == 0) {
+        for (int w = 0; w < nwalk; ++w) {
+            const int key0 = (KWALK ? (w * nsplit + split) : split) * KEYS_WG + t * CH * 16;
+#pragma unroll
+            for (int c = 0; c < CH; ++c) {
+                if (key0 + 16 * c < n_kv) {
+                    blk bb;
+                    load(bb, key0 + 16 * c);
+                    compute_xmx(bb);
+                }
+            }
+        }
+    } else
     // ---- main loop: CH chunks in flight. KWALK: nsplit=1, walk every KEYS_WG slice (K once per Q-tile).
     for (int w = 0; w < nwalk; ++w) {
-        const int key0 = (KWALK ? w : split) * KEYS_WG + t * CH * 16;
+        const int key0 = (KWALK ? (w * nsplit + split) : split) * KEYS_WG + t * CH * 16;
         blk B[CH];
 #pragma unroll
         for (int c = 0; c < CH; ++c) {
@@ -484,6 +500,317 @@ ESIMD_INLINE void fattn_dec_q4_0(const int8_t * Q8, const float * Qc, const uint
     }
 }
 
+template <int RQ, int T, int NTOK, int CH>
+ESIMD_INLINE void fattn_dec_q4_0_d128(const int8_t * Q8, const float * Qc, const uint32_t * K, const uint8_t * V,
+                                      const char * mask, float * parts, sycl::float2 * meta,
+                                      const int k_pitch, const int k_head_b, const int v_pitch,
+                                      const int v_head_b, const int mask_stride, const int n_kv, const int n_kvh,
+                                      const int n_head, const int nsplit, const int ntok_all,
+                                      const sycl::nd_item<1> & it) {
+    constexpr int KEYS_WG = T * CH * 16;
+    constexpr int D       = 128;
+    constexpr int SLOT_F  = RQ * D + 2 * RQ;
+    constexpr int NSLOT   = (T / 2 > 0 ? T / 2 : 1) * NTOK;
+    slm_init<NSLOT * SLOT_F * 4>();
+
+    const int g           = it.get_group(0);
+    const int h           = g % n_kvh;
+    const int split       = g / n_kvh;
+    const int l           = it.get_local_id(0);
+    const int t           = l % T;
+    const int tok         = l / T;
+    const int tok_q       = tok < ntok_all ? tok : ntok_all - 1;
+
+    simd<int, 32>  Qd[RQ];
+    simd<float, 4> c0[RQ], c1[RQ];
+#pragma unroll
+    for (int r = 0; r < RQ; ++r) {
+        const size_t     qrow = (size_t) tok_q * n_head + (size_t) (h * RQ + r);
+        simd<int8_t, 128> q8   = block_load<int8_t, 128>(Q8 + qrow * 128);
+        simd<float, 8>    cc   = block_load<float, 8>(Qc + qrow * 8);
+        c0[r] = cc.template select<4, 1>(0);
+        c1[r] = cc.template select<4, 1>(4);
+        Qd[r] = q8.template bit_cast_view<int>();
+    }
+
+    simd<float, D> O[RQ];
+    float           m[RQ], lsum[RQ];
+#pragma unroll
+    for (int r = 0; r < RQ; ++r) {
+        O[r]    = 0.0f;
+        m[r]    = -FLT_MAX / 2.0f;
+        lsum[r] = 0.0f;
+    }
+
+    struct blk {
+        simd<uint32_t, 128> Tk[2];
+        simd<uint32_t, 32>  Tk2;
+        simd<uint8_t, 1024> V0;
+        simd<uint8_t, 256>  V1;
+        simd<uint16_t, 16>  mk;
+    };
+    const uint16_t * mrow = (const uint16_t *) (mask + (size_t) mask_stride * tok_q);
+
+    auto load = [&](blk & b, int key) {
+#pragma unroll
+        for (int n = 0; n < 16; ++n) {
+            const uint32_t * kp = (const uint32_t *) ((const char *) K + (size_t) k_head_b * (size_t) h
+                + (size_t) (key + n) * (size_t) k_pitch);
+            simd<uint32_t, 16> a;
+            a.copy_from(kp);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                b.Tk[0][n + 16 * i] = a[i];
+                b.Tk[1][n + 16 * i] = a[i + 8];
+            }
+            b.Tk2[n]      = kp[16];
+            b.Tk2[n + 16] = kp[17];
+            const uint8_t * vr = (const uint8_t *) V + (size_t) v_head_b * (size_t) h
+                + (size_t) (key + n) * (size_t) v_pitch;
+            simd<uint8_t, 64> vlo;
+            simd<uint8_t, 16> vhi;
+            vlo.copy_from(vr);
+            vhi.copy_from(vr + 64);
+            b.V0.template select<64, 1>(64 * n) = vlo;
+            b.V1.template select<16, 1>(16 * n) = vhi;
+        }
+        b.mk = block_load<uint16_t, 16>(mrow + key);
+    };
+
+    auto Tsel = [&](blk & b, int i) -> simd<uint32_t, 16> {
+        if (i < 8) {
+            return b.Tk[0].template select<16, 1>(16 * i);
+        }
+        if (i < 16) {
+            return b.Tk[1].template select<16, 1>(16 * (i - 8));
+        }
+        return b.Tk2.template select<16, 1>(16 * (i - 16));
+    };
+
+    auto compute = [&](blk & b) {
+        simd<float, 16> S[RQ];
+#pragma unroll
+        for (int r = 0; r < RQ; ++r) S[r] = 0.0f;
+
+#pragma unroll
+        for (int bq = 0; bq < 4; ++bq) {
+            simd<uint32_t, 16> qd[4];
+            simd<uint32_t, 16> dk;
+            if (bq % 2 == 0) {
+                const int i0 = 9 * (bq / 2);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    qd[j] = (Tsel(b, i0 + j) >> 16u) | (Tsel(b, i0 + j + 1) << 16u);
+                }
+                dk = Tsel(b, i0) & 0xFFFFu;
+            } else {
+                const int i0 = 9 * (bq / 2) + 5;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    qd[j] = Tsel(b, i0 + j);
+                }
+                dk = Tsel(b, i0 - 1) >> 16u;
+            }
+            simd<uint16_t, 16>   dk16 = convert<uint16_t>(dk);
+            simd<sycl::half, 16> dkh  = dk16.template bit_cast_view<sycl::half>();
+            simd<float, 16>      dkf  = convert<float>(dkh);
+            simd<int, 16>        lo[4], hi[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                simd<uint32_t, 16> lo_u = qd[j] & 0x0F0F0F0Fu;
+                simd<uint32_t, 16> hi_u = (qd[j] >> 4u) & 0x0F0F0F0Fu;
+                lo[j] = lo_u.template bit_cast_view<int>();
+                hi[j] = hi_u.template bit_cast_view<int>();
+            }
+#pragma unroll
+            for (int r = 0; r < RQ; ++r) {
+                simd<int, 16> acc = 0;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int qlo = Qd[r][8 * bq + j];
+                    const int qhi = Qd[r][8 * bq + 4 + j];
+                    acc = dp4a<int, int, int, int, 16>(acc, lo[j], simd<int, 16>(qlo));
+                    acc = dp4a<int, int, int, int, 16>(acc, hi[j], simd<int, 16>(qhi));
+                }
+                const float cc0 = c0[r][bq];
+                const float cc1 = c1[r][bq];
+                S[r] += dkf * (convert<float>(acc) * cc0 + cc1);
+            }
+        }
+
+        simd<sycl::half, 16> mh = b.mk.template bit_cast_view<sycl::half>();
+        simd<float, 16>      mf = convert<float>(mh);
+
+        simd<float, 16> P[RQ];
+#pragma unroll
+        for (int r = 0; r < RQ; ++r) {
+            S[r] += mf;
+            const float    smax = hmax<float>(S[r]);
+            const float    mnew = m[r] > smax ? m[r] : smax;
+            simd<float, 2> ea;
+            ea[0] = m[r] - mnew;
+            ea[1] = 0.0f;
+            simd<float, 2> eav = exp(ea);
+            const float     a   = eav[0];
+            P[r]    = exp(S[r] - mnew);
+            lsum[r] = lsum[r] * a + reduce<float>(P[r], std::plus<>());
+            m[r]    = mnew;
+            O[r] *= a;
+        }
+
+#pragma unroll
+        for (int n = 0; n < 16; ++n) {
+            simd<uint8_t, 64>  row0 = b.V0.template select<64, 1>(64 * n);
+            simd<uint8_t, 16>  row1 = b.V1.template select<16, 1>(16 * n);
+            simd<uint16_t, 32> row0h = row0.template bit_cast_view<uint16_t>();
+#pragma unroll
+            for (int bv = 0; bv < 4; ++bv) {
+                simd<uint8_t, 16> qs;
+                simd<uint16_t, 1> dbits;
+                if (bv < 3) {
+                    qs    = row0.template select<16, 1>(2 + 18 * bv);
+                    dbits = row0h.template select<1, 1>(9 * bv);
+                } else {
+                    qs    = row1;
+                    dbits = row0h.template select<1, 1>(27);
+                }
+                simd<sycl::half, 1> dvh = dbits.template bit_cast_view<sycl::half>();
+                simd<float, 1>      dv1 = convert<float>(dvh);
+                const float          dv  = dv1[0];
+                const float          dv8 = -8.0f * dv;
+                simd<float, 16>     vlo = convert<float>(qs & (uint8_t) 0x0F) * dv + dv8;
+                simd<float, 16>     vhi = convert<float>(qs >> (uint8_t) 4) * dv + dv8;
+#pragma unroll
+                for (int r = 0; r < RQ; ++r) {
+                    const float p = P[r][n];
+                    O[r].template select<16, 1>(32 * bv)      += vlo * p;
+                    O[r].template select<16, 1>(32 * bv + 16) += vhi * p;
+                }
+            }
+        }
+    };
+
+    const int key0 = split * KEYS_WG + t * CH * 16;
+    blk        B[CH];
+#pragma unroll
+    for (int c = 0; c < CH; ++c) {
+        if (key0 + 16 * c < n_kv) load(B[c], key0 + 16 * c);
+    }
+#pragma unroll
+    for (int c = 0; c < CH; ++c) {
+        if (key0 + 16 * c < n_kv) compute(B[c]);
+    }
+
+    const int slot_base = tok * (T / 2);
+#pragma unroll
+    for (int s = T / 2; s >= 1; s >>= 1) {
+        if (t >= s && t < 2 * s) {
+            const uint32_t off = (uint32_t) (slot_base + (t - s)) * SLOT_F * 4;
+#pragma unroll
+            for (int r = 0; r < RQ; ++r) {
+#pragma unroll
+                for (int q = 0; q < D / 32; ++q) {
+                    slm_block_store<float, 32>(off + (r * D + 32 * q) * 4, O[r].template select<32, 1>(32 * q));
+                }
+            }
+            simd<float, 2 * RQ> ml;
+#pragma unroll
+            for (int r = 0; r < RQ; ++r) {
+                ml[r]      = m[r];
+                ml[RQ + r] = lsum[r];
+            }
+            slm_scatter<float, 2 * RQ>(simd<uint32_t, 2 * RQ>(off + RQ * D * 4, 4), ml);
+        }
+        barrier();
+        if (t < s) {
+            const uint32_t      off = (uint32_t) (slot_base + t) * SLOT_F * 4;
+            simd<float, 2 * RQ> ml  = slm_gather<float, 2 * RQ>(simd<uint32_t, 2 * RQ>(off + RQ * D * 4, 4));
+#pragma unroll
+            for (int r = 0; r < RQ; ++r) {
+                const float    mp   = ml[r];
+                const float    lp   = ml[RQ + r];
+                const float    mnew = m[r] > mp ? m[r] : mp;
+                simd<float, 2> ea;
+                ea[0] = m[r] - mnew;
+                ea[1] = mp - mnew;
+                simd<float, 2> eav = exp(ea);
+                const float    a   = eav[0];
+                const float    ap  = eav[1];
+                lsum[r] = lsum[r] * a + lp * ap;
+                m[r]    = mnew;
+                O[r] *= a;
+#pragma unroll
+                for (int q = 0; q < D / 32; ++q) {
+                    simd<float, 32> op = slm_block_load<float, 32>(off + (r * D + 32 * q) * 4);
+                    O[r].template select<32, 1>(32 * q) += op * ap;
+                }
+            }
+        }
+        barrier();
+    }
+
+    if (t == 0 && tok < ntok_all) {
+#pragma unroll
+        for (int r = 0; r < RQ; ++r) {
+            const size_t pidx = ((size_t) tok * n_head + (size_t) (h * RQ + r)) * nsplit + split;
+            float *       po  = parts + pidx * D;
+            block_store<float, 64>(po, O[r].template select<64, 1>(0));
+            block_store<float, 64>(po + 64, O[r].template select<64, 1>(64));
+            simd<float, 2> ml;
+            ml[0] = m[r];
+            ml[1] = lsum[r];
+            scatter<float, 2>((float *) (meta + pidx), simd<uint32_t, 2>(0, 4), ml);
+        }
+    }
+}
+
+template <int RQ, int T, int NTOK, int CH>
+void launch_fattn_dec_q4_0_d128(dpct::queue_ptr stream, const int8_t * Q8, const float * Qc, const uint32_t * K,
+                                const uint8_t * V, const char * mask, float * parts, sycl::float2 * meta,
+                                int k_pitch, int k_head_b, int v_pitch, int v_head_b, int mask_stride, int n_kv,
+                                int n_kvh, int n_head, int nsplit, int ntok_all) {
+    const size_t wg = (size_t) T * NTOK;
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) nsplit * n_kvh * wg), sycl::range<1>(wg)),
+        sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
+        [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+            fattn_dec_q4_0_d128<RQ, T, NTOK, CH>(Q8, Qc, K, V, mask, parts, meta, k_pitch, k_head_b, v_pitch,
+                                                 v_head_b, mask_stride, n_kv, n_kvh, n_head, nsplit, ntok_all, it);
+        });
+}
+
+static void fattn_q8_prepass_d128(dpct::queue_ptr stream, const char * Q, int8_t * Q8, float * Qc, float scale,
+                                  int nb01, int nb02, int ntok, int n_head, int q_f16) {
+    const size_t n = (size_t) ntok * n_head * 4;
+    stream->parallel_for(sycl::range<1>(n), [=](sycl::id<1> wi) {
+        const int    i    = (int) wi[0];
+        const int    b    = i % 4;
+        const int    head = (i / 4) % n_head;
+        const int    tok  = i / (4 * n_head);
+        const char * row  = Q + (size_t) nb02 * head + (size_t) nb01 * tok;
+        float amax = 0.0f;
+        float xv[32];
+        for (int k = 0; k < 32; ++k) {
+            const float v = q_f16 ? (float) ((const sycl::half *) row)[32 * b + k] * scale
+                                   : ((const float *) row)[32 * b + k] * scale;
+            xv[k] = v;
+            amax = sycl::fmax(amax, sycl::fabs(v));
+        }
+        const float d  = amax / 127.0f;
+        const float id = amax > 0.0f ? 127.0f / amax : 0.0f;
+        int8_t * q     = Q8 + ((size_t) tok * n_head + head) * 128 + 32 * b;
+        int      sum   = 0;
+        for (int k = 0; k < 32; ++k) {
+            const int v = (int) sycl::round(xv[k] * id);
+            q[k] = (int8_t) v;
+            sum += v;
+        }
+        float * c = Qc + ((size_t) tok * n_head + head) * 8;
+        c[b]     = d;
+        c[4 + b] = -8.0f * d * (float) sum;
+    });
+}
+
 // Q -> q8 per 32-dim block with the softmax scale folded in (one work-item per block).
 // Q8[tok][head][256] int8; Qc[tok][head][0..7] = d, Qc[tok][head][8..15] = -8 * d * sum(q8).
 static void fattn_q8_prepass(dpct::queue_ptr stream, const char * Q, int8_t * Q8, float * Qc, float scale,
@@ -541,6 +868,13 @@ constexpr int fattn_esimd_T(int rq, int ntok) {
     }
     return t;
 }
+constexpr int fattn_esimd_T_d128(int rq, int ntok) {
+    int t = 8;
+    while (t > 1 && (t * ntok * rq > 126 || t * ntok > 32)) {
+        t >>= 1;
+    }
+    return t;
+}
 constexpr int fattn_esimd_keys_per_wg(int rq, int ntok, int ch) { return fattn_esimd_T(rq, ntok) * ch * 16; }
 
 // GGML_SYCL_FA_ESIMD: 0 = off, 1 = dp4a kernel [default: fp32 P*V, PPL-neutral], 2 = XMX (dpas) kernel
@@ -570,6 +904,16 @@ static int fattn_esimd_prefill_f16() {
     return v;
 }
 
+static int fattn_esimd_prefill_walk() {
+    static const int v = ggml_sycl_get_env("GGML_SYCL_FA_ESIMD_PREFILL_WALK", 0);
+    return v;
+}
+
+static int fattn_esimd_d128() {
+    static const int v = ggml_sycl_get_env("GGML_SYCL_FA_ESIMD_D128", 0);
+    return v;
+}
+
 }  // namespace
 
 #endif  // GGML_SYCL_FATTN_HAS_ESIMD
@@ -594,19 +938,29 @@ bool ggml_sycl_flash_attn_ext_esimd_supported(const ggml_tensor * dst) {
     if (!Q || !K || !V || !mask || sinks) {
         return false;
     }
-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_Q4_0 || V->type != GGML_TYPE_Q4_0 ||
+    if ((Q->type != GGML_TYPE_F32 && Q->type != GGML_TYPE_F16) || K->type != GGML_TYPE_Q4_0 || V->type != GGML_TYPE_Q4_0 ||
         mask->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32) {
         return false;
     }
-    if (Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256) {
+    if (Q->ne[0] == 128 && K->ne[0] == 128 && V->ne[0] == 128) {
+        if (fattn_esimd_d128() <= 0) {
+            return false;
+        }
+        if (Q->ne[1] < 1 || Q->ne[1] > 4) {
+            return false;
+        }
+    } else if (Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256) {
         return false;
     }
     if (Q->ne[1] < 1 || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1) {
         return false;
     }
-    if (Q->ne[1] > 4 && (Q->ne[1] < 32 || (fattn_esimd_prefill() <= 0 && fattn_esimd_prefill_dpas() <= 0 &&
-                                           fattn_esimd_prefill_kvh() <= 0 && fattn_esimd_prefill_f16() <= 0))) {
-        return false;
+    if (Q->ne[0] == 256 && Q->ne[1] > 4) {
+        const int walk_ok = fattn_esimd_prefill_walk() > 0 && Q->type == GGML_TYPE_F32;
+        if (Q->ne[1] < 32 || (fattn_esimd_prefill() <= 0 && fattn_esimd_prefill_dpas() <= 0 &&
+                              fattn_esimd_prefill_kvh() <= 0 && fattn_esimd_prefill_f16() <= 0 && !walk_ok)) {
+            return false;
+        }
     }
     if (K->ne[2] != V->ne[2] || Q->ne[2] % K->ne[2] != 0) {
         return false;
@@ -626,8 +980,12 @@ bool ggml_sycl_flash_attn_ext_esimd_supported(const ggml_tensor * dst) {
         return false;
     }
     // LSC 2D block loads: 64 B aligned base, 16 B multiple pitch, 4 B aligned x offsets
-    if (((uintptr_t) K->data & 63) || ((uintptr_t) V->data & 63) || K->nb[1] % 16 || V->nb[1] % 16 ||
-        K->nb[2] % 4 || V->nb[2] % 4 || K->nb[1] > (1u << 24) || V->nb[1] > (1u << 24)) {
+    if (Q->ne[0] == 256) {
+        if (((uintptr_t) K->data & 63) || ((uintptr_t) V->data & 63) || K->nb[1] % 16 || V->nb[1] % 16 ||
+            K->nb[2] % 4 || V->nb[2] % 4 || K->nb[1] > (1u << 24) || V->nb[1] > (1u << 24)) {
+            return false;
+        }
+    } else if (K->nb[1] < 72 || V->nb[1] < 72 || K->nb[1] > (1u << 24) || V->nb[1] > (1u << 24)) {
         return false;
     }
     if (((uintptr_t) mask->data & 31) || mask->nb[1] % 32 || Q->nb[1] % 16 || Q->nb[2] % 16 ||
@@ -653,14 +1011,77 @@ void ggml_sycl_flash_attn_ext_esimd(ggml_backend_sycl_context & ctx, ggml_tensor
     const int n_kvh  = (int) K->ne[2];
     const int gqa    = n_head / n_kvh;
     const int n_kv   = (int) K->ne[1];
-    const bool xmx   = fattn_esimd_mode() >= 2;
+    static const int xmx_min_kv = ggml_sycl_get_env("GGML_SYCL_FA_XMX_MIN_KV", 0);
+    const bool xmx   = fattn_esimd_mode() >= 2 || (xmx_min_kv > 0 && ntok <= 4 && n_kv >= xmx_min_kv);
     const int ch     = 2;  // 16-key chunks per thread (both in flight); 4 spills, 1 leaves the fixed costs unamortized
     const int tile_n = ntok > 4 ? 4 : ntok;
+
+    if (Q->ne[0] == 128) {
+        const int kpw    = fattn_esimd_T_d128(gqa, ntok) * ch * 16;
+        const int nsplit = (n_kv + kpw - 1) / kpw;
+        float scale = 1.0f;
+        memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+        ggml_sycl_pool &                   pool = ctx.pool();
+        dpct::queue_ptr                    stream = ctx.stream();
+        ggml_sycl_pool_alloc<float>        parts(pool, (size_t) nsplit * ntok * n_head * 128);
+        ggml_sycl_pool_alloc<sycl::float2> meta(pool, (size_t) nsplit * ntok * n_head);
+        ggml_sycl_pool_alloc<int8_t>       q8(pool, (size_t) ntok * n_head * 128);
+        ggml_sycl_pool_alloc<float>        qc(pool, (size_t) ntok * n_head * 8);
+        fattn_q8_prepass_d128(stream, (const char *) Q->data, q8.get(), qc.get(), scale, (int) Q->nb[1], (int) Q->nb[2],
+                              ntok, n_head, Q->type == GGML_TYPE_F16 ? 1 : 0);
+#define FA_ESIMD_D128(RQ_, NTOK_)                                                                                   \
+    if (gqa == RQ_ && ntok == NTOK_) {                                                                               \
+        launch_fattn_dec_q4_0_d128<RQ_, fattn_esimd_T_d128(RQ_, NTOK_), NTOK_, 2>(                                   \
+            stream, q8.get(), qc.get(), (const uint32_t *) K->data, (const uint8_t *) V->data,                       \
+            (const char *) mask->data, parts.get(), meta.get(), (int) K->nb[1], (int) K->nb[2], (int) V->nb[1],    \
+            (int) V->nb[2], (int) mask->nb[1], n_kv, n_kvh, n_head, nsplit, ntok);                                    \
+    } else
+        FA_ESIMD_D128(6, 1) FA_ESIMD_D128(6, 2) FA_ESIMD_D128(6, 3) FA_ESIMD_D128(6, 4)
+        FA_ESIMD_D128(8, 1) FA_ESIMD_D128(8, 2) FA_ESIMD_D128(8, 3) FA_ESIMD_D128(8, 4)
+        {
+            GGML_ABORT("fattn esimd d128: unsupported gqa/ntok");
+        }
+#undef FA_ESIMD_D128
+        SYCL_CHECK(0);
+        {
+            const dpct::dim3 block_dim_combine(128, 1, 1);
+            const dpct::dim3 blocks_num_combine(ntok, n_head, 1);
+            const size_t     nbytes_shared_combine = (size_t) nsplit * sizeof(sycl::float2);
+            float *          parts_ptr = parts.get();
+            sycl::float2 *   meta_ptr  = meta.get();
+            float *          dst_ptr   = (float *) dst->data;
+            const int        parallel_blocks = nsplit;
+            stream->submit([&](sycl::handler & cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(sycl::range<1>(nbytes_shared_combine), cgh);
+                cgh.parallel_for(sycl::nd_range<3>(blocks_num_combine * block_dim_combine, block_dim_combine),
+                                 [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                     GGML_UNUSED(item_ct1);
+                                     flash_attn_combine_results<128>(
+                                         parts_ptr, meta_ptr, dst_ptr, parallel_blocks,
+                                         dpct_local_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
+                                 });
+            });
+        }
+        SYCL_CHECK(0);
+        return;
+    }
+
     const int kpw    = fattn_esimd_keys_per_wg(gqa, tile_n, ch);
     const bool use_f16_prefill  = ntok > 4 && fattn_esimd_prefill_f16() > 0;
     const bool use_kvh_prefill  = ntok > 4 && fattn_esimd_prefill_kvh() > 0 && !use_f16_prefill;
     const bool use_dpas_prefill = ntok > 4 && fattn_esimd_prefill_dpas() > 0 && !use_kvh_prefill && !use_f16_prefill;
-    const int nsplit = (use_dpas_prefill || use_kvh_prefill) ? 1 : (n_kv + kpw - 1) / kpw;
+    const bool use_walk_prefill = ntok > 4 && fattn_esimd_prefill_walk() > 0 && Q->type == GGML_TYPE_F32
+        && !use_f16_prefill && !use_kvh_prefill && !use_dpas_prefill;
+    static const int dec_maxsplit = ggml_sycl_get_env("GGML_SYCL_FA_DEC_MAXSPLIT", 0);
+    const int nsplit_full = (use_dpas_prefill || use_kvh_prefill || use_walk_prefill) ? 1 : (n_kv + kpw - 1) / kpw;
+    static const int dec_walk = ggml_sycl_get_env("GGML_SYCL_FA_DEC_WALK", 0);  // XMX decode: walk keys with this many splits
+    const bool walk_x = ntok <= 4 && xmx && dec_walk > 0 && nsplit_full > dec_walk;
+    const bool walk = walk_x || (ntok <= 4 && dec_maxsplit > 0 && nsplit_full > dec_maxsplit);
+    const int nsplit = walk ? (walk_x ? dec_walk : dec_maxsplit) : nsplit_full;
+    static const int dec_time = ggml_sycl_get_env("GGML_SYCL_FA_DEC_TIME", 0);
+    static const int dec_xv = ggml_sycl_get_env("GGML_SYCL_FA_DEC_XV", 0);  // timing only: 1 = loads no math, 3 = no loads
+    std::chrono::steady_clock::time_point dt0;
+    if (dec_time && ntok <= 4) { ctx.stream()->wait(); dt0 = std::chrono::steady_clock::now(); }
 
     if (use_f16_prefill) {
         ggml_sycl_flash_attn_ext_esimd_prefill_f16(ctx, dst);
@@ -750,9 +1171,58 @@ void ggml_sycl_flash_attn_ext_esimd(ggml_backend_sycl_context & ctx, ggml_tensor
         return;
     }
 
+    if (use_walk_prefill) {
+#define FA_ESIMD_WALK(RQ_)                                                                                           \
+        if (gqa == RQ_) {                                                                                            \
+            launch_fattn_dec_q4_0<RQ_, fattn_esimd_T(RQ_, 4), 4, false, 2, 0, true, true>(                            \
+                stream, q8.get(), qc.get(), Kp, Vp, Mp, parts.get(), meta.get(), kp, khd, vp, vhb, ms, n_kv, n_kvh, \
+                n_head, 1, ntok);                                                                                    \
+        } else
+        FA_ESIMD_WALK(6) FA_ESIMD_WALK(8) { GGML_ABORT("fattn esimd walk prefill: unsupported gqa"); }
+#undef FA_ESIMD_WALK
+        SYCL_CHECK(0);
+        {
+            const int        nsplit_d = 1;
+            const dpct::dim3 block_dim_combine(256, 1, 1);
+            const dpct::dim3 blocks_num_combine(ntok, n_head, 1);
+            const size_t     nbytes_shared_combine = (size_t) nsplit_d * sizeof(sycl::float2);
+            float *          parts_ptr = parts.get();
+            sycl::float2 *   meta_ptr  = meta.get();
+            float *          dst_ptr   = (float *) dst->data;
+            stream->submit([&](sycl::handler & cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(sycl::range<1>(nbytes_shared_combine), cgh);
+                cgh.parallel_for(sycl::nd_range<3>(blocks_num_combine * block_dim_combine, block_dim_combine),
+                                 [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                     GGML_UNUSED(item_ct1);
+                                     flash_attn_combine_results<256>(
+                                         parts_ptr, meta_ptr, dst_ptr, nsplit_d,
+                                         dpct_local_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
+                                 });
+            });
+        }
+        SYCL_CHECK(0);
+        return;
+    }
+
 #define FA_ESIMD_CASE(RQ_, NTOK_)                                                                                    \
     if (gqa == RQ_ && ntok == NTOK_) {                                                                               \
-        if (xmx) {                                                                                                   \
+        if (walk && xmx) {                                                                                           \
+            launch_fattn_dec_q4_0<RQ_, fattn_esimd_T(RQ_, NTOK_), NTOK_, true, 2, 0, false, true>(                   \
+                stream, q8.get(), qc.get(), Kp, Vp, Mp, parts.get(), meta.get(), kp, khd, vp, vhb, ms, n_kv,        \
+                n_kvh, n_head, nsplit, ntok);                                                                        \
+        } else if (walk) {                                                                                           \
+            launch_fattn_dec_q4_0<RQ_, fattn_esimd_T(RQ_, NTOK_), NTOK_, false, 2, 0, false, true>(                  \
+                stream, q8.get(), qc.get(), Kp, Vp, Mp, parts.get(), meta.get(), kp, khd, vp, vhb, ms, n_kv,        \
+                n_kvh, n_head, nsplit, ntok);                                                                        \
+        } else if (xmx && dec_xv == 1) {                                                                             \
+            launch_fattn_dec_q4_0<RQ_, fattn_esimd_T(RQ_, NTOK_), NTOK_, true, 2, 1>(                                \
+                stream, q8.get(), qc.get(), Kp, Vp, Mp, parts.get(), meta.get(), kp, khd, vp, vhb, ms, n_kv,        \
+                n_kvh, n_head, nsplit, ntok);                                                                        \
+        } else if (xmx && dec_xv == 3) {                                                                             \
+            launch_fattn_dec_q4_0<RQ_, fattn_esimd_T(RQ_, NTOK_), NTOK_, true, 2, 3>(                                \
+                stream, q8.get(), qc.get(), Kp, Vp, Mp, parts.get(), meta.get(), kp, khd, vp, vhb, ms, n_kv,        \
+                n_kvh, n_head, nsplit, ntok);                                                                        \
+        } else if (xmx) {                                                                                            \
             launch_fattn_dec_q4_0<RQ_, fattn_esimd_T(RQ_, NTOK_), NTOK_, true, 2>(                                   \
                 stream, q8.get(), qc.get(), Kp, Vp, Mp, parts.get(), meta.get(), kp, khd, vp, vhb, ms, n_kv,        \
                 n_kvh, n_head, nsplit, ntok);                                                                        \
@@ -779,6 +1249,8 @@ void ggml_sycl_flash_attn_ext_esimd(ggml_backend_sycl_context & ctx, ggml_tensor
     }
 #undef FA_ESIMD_CASE
     SYCL_CHECK(0);
+    std::chrono::steady_clock::time_point dt1;
+    if (dec_time && ntok <= 4) { stream->wait(); dt1 = std::chrono::steady_clock::now(); }
 
     // combine the key splits: same layout as launch_fattn's parallel_blocks path
     {
@@ -801,6 +1273,22 @@ void ggml_sycl_flash_attn_ext_esimd(ggml_backend_sycl_context & ctx, ggml_tensor
         });
     }
     SYCL_CHECK(0);
+    if (dec_time && ntok <= 4) {
+        stream->wait();
+        const auto dt2 = std::chrono::steady_clock::now();
+        static double s_k = 0, s_c = 0, s_kv = 0;
+        static int    s_n = 0;
+        s_k += std::chrono::duration<double, std::milli>(dt1 - dt0).count();
+        s_c += std::chrono::duration<double, std::milli>(dt2 - dt1).count();
+        s_kv += n_kv;
+        if (++s_n == 256) {
+            GGML_SYCL_XE2_LOG( "fa_dec_time n=256 avg_kv=%.0f ntok=%d nsplit=%d walk=%d xmx=%d kern=%.3f ms comb=%.3f ms\n",
+                    s_kv / 256, ntok, nsplit, (int) walk, (int) xmx, s_k / 256, s_c / 256);
+            fflush(stderr);
+            s_k = s_c = s_kv = 0;
+            s_n = 0;
+        }
+    }
 #else
     GGML_UNUSED(ctx);
     GGML_UNUSED(dst);

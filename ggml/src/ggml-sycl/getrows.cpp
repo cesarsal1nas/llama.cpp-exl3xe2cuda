@@ -14,6 +14,7 @@
 #include "common.hpp"
 #include "dequantize.hpp"
 #include "getrows.hpp"
+#include "xe2mx.hpp"
 
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
@@ -330,6 +331,12 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
             break;
         case GGML_TYPE_Q4_0:
             get_rows_sycl<QK4_0, QR4_0, dequantize_q4_0>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
+            src1_i32, (float *)dst->data, ctx.stream());
+            break;
+        case GGML_TYPE_XE2MX4:
+            GGML_ASSERT(ggml_sycl_xe2mx_lo_bytes_are_soa(dst->src[0]) &&
+                        "LO_INLINE weight cannot use block_xe2mx4 get_rows");
+            get_rows_sycl<QK_XE2MX4, QR_XE2MX4, dequantize_xe2mx4>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
             src1_i32, (float *)dst->data, ctx.stream());
             break;
         case GGML_TYPE_Q4_1:

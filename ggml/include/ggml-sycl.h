@@ -25,7 +25,7 @@ GGML_BACKEND_API bool ggml_backend_is_sycl(ggml_backend_t backend);
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device);
 
 // split tensor buffer that splits matrices by rows across multiple devices
-GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(const float * tensor_split);
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(int main_device, const float * tensor_split);
 
 // Tensor parallelism (--split-mode tensor): comm_init/free/allreduce_tensor
 // trio queried by the meta-backend via ggml_backend_reg_get_proc_address.
@@ -34,6 +34,8 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(
 GGML_BACKEND_API void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends);
 GGML_BACKEND_API void   ggml_backend_sycl_comm_free(void * comm_ctx);
 GGML_BACKEND_API bool   ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx, struct ggml_tensor ** tensors);
+// Collapsed executor (see ggml_backend_comm_graph_compute_t in ggml-backend.h).
+GGML_BACKEND_API bool   ggml_backend_sycl_comm_graph_compute(void * comm_ctx, struct ggml_cgraph ** cgraphs, size_t n_graphs);
 
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type(void);
@@ -51,6 +53,10 @@ GGML_BACKEND_API void ggml_backend_sycl_get_device_memory(int device, size_t *fr
 // GGML_BACKEND_API void ggml_backend_sycl_unregister_host_buffer(void * buffer);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_sycl_reg(void);
+
+GGML_BACKEND_API size_t ggml_sycl_quantize_xe2mx4(const void * src, enum ggml_type src_type,
+                                                   void * dst, int64_t nrows, int64_t n_per_row,
+                                                   const float * imatrix);
 
 #ifdef  __cplusplus
 }

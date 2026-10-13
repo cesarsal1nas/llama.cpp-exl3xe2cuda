@@ -70,6 +70,22 @@ static __dpct_inline__ void dequantize_q4_0(const void *vx, const int64_t ib,
 #endif // GGML_SYCL_F16
 }
 
+static __dpct_inline__ void dequantize_xe2mx4(const void *vx, const int64_t ib,
+                                              const int iqs, dfloat2 &v) {
+    const block_xe2mx4 * x = (const block_xe2mx4 *) vx;
+    const dfloat d = x[ib].d;
+    const uint8_t vui = x[ib].qs[iqs / 2];
+    const float q0 = (float) ((int) (vui & 0xF) - 8);
+    const float q1 = (float) ((int) (vui >> 4) - 8);
+#ifdef GGML_SYCL_F16
+    v.s0() = (dfloat) (q0 * (float) d);
+    v.s1() = (dfloat) (q1 * (float) d);
+#else
+    v.x() = q0 * d;
+    v.y() = q1 * d;
+#endif
+}
+
 static __dpct_inline__ void dequantize_q4_0_reorder(const void *d_ptr, const int64_t ib, const void *qs,
                                             const int iqs, dfloat2 &v) {
     // const block_q4_0 * x = (const block_q4_0 *) vx;
@@ -814,6 +830,29 @@ static void dequantize_block_q4_0(const void * __restrict__ vx, dst_t * __restri
     for (int l = 0; l < 4; ++l) {
         y[l+ 0] = d * (q[l] & 0xF) + dm;
         y[l+16] = d * (q[l] >>  4) + dm;
+    }
+}
+
+template<typename dst_t>
+static void dequantize_block_xe2mx4(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t nb32,
+                                     const sycl::nd_item<3> &item_ct1) {
+    const int64_t i = item_ct1.get_group(2);
+    const int64_t tid = item_ct1.get_local_id(2);
+    const int64_t il  = tid/8;
+    const int64_t ir  = tid%8;
+    const int64_t ib = 8*i + ir;
+    if (ib >= nb32) {
+        return;
+    }
+
+    dst_t * y = yy + 256*i + 32*ir + 8*il;
+    const block_xe2mx4 * x = (const block_xe2mx4 *)vx + ib;
+    const float d = sycl::vec<sycl::half, 1>(x->d)
+                        .convert<float, sycl::rounding_mode::automatic>()[0];
+    const uint8_t * q = x->qs + 4*il;
+    for (int l = 0; l < 4; ++l) {
+        y[2*l+0] = d * ((q[l] & 0xF) - 8);
+        y[2*l+1] = d * ((q[l] >>  4) - 8);
     }
 }
 

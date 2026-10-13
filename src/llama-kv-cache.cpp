@@ -1742,6 +1742,12 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 }
 
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    // Causal graph builds its own mask (GenIndex), so the dense host mask is dead work:
+    // ~512 MB of f16 writes per 128k x 2048 chunk. Skip behind an env so it can be measured
+    // and reverted without a rebuild. Non-causal and SWA caches still need the mask.
+    if (causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && getenv("LLAMA_SKIP_KQ_MASK")) {
+        return;
+    }
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));

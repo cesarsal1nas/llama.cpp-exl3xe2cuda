@@ -252,6 +252,32 @@ class Q4_0(__Quant, qtype=GGMLQuantizationType.Q4_0):
         return (d * qs.astype(np.float32))
 
 
+class XE2MX4(__Quant, qtype=GGMLQuantizationType.XE2MX4):
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+        amax = np.max(np.abs(blocks), axis=-1, keepdims=True)
+        d = amax / np.float32(8)
+        with np.errstate(divide="ignore"):
+            id = np.where(d == 0, 0, 1 / d)
+        q = np.rint(blocks * id).astype(np.int32)
+        q = np.clip(q, -8, 7).astype(np.int8) + np.int8(8)
+        q = q.astype(np.uint8).reshape((n_blocks, cls.block_size // 2, 2))
+        qs = q[..., 0] | (q[..., 1] << np.uint8(4))
+        d = d.astype(np.float16).view(np.uint8)
+        return np.concatenate([d, qs], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+        d, qs = np.hsplit(blocks, [2])
+        d = d.view(np.float16).astype(np.float32)
+        lo = (qs & np.uint8(0x0F)).astype(np.int8) - np.int8(8)
+        hi = (qs >> np.uint8(4)).astype(np.int8) - np.int8(8)
+        q = np.stack((lo, hi), axis=-1).reshape((n_blocks, cls.block_size))
+        return d * q.astype(np.float32)
+
+
 class Q4_1(__Quant, qtype=GGMLQuantizationType.Q4_1):
     @classmethod
     def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:

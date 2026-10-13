@@ -149,6 +149,33 @@ bool ggml_sycl_is_gdn_conv_concat(const ggml_tensor * concat) {
     return true;
 }
 
+bool ggml_sycl_conv_state_gather(const ggml_tensor * st, const float ** data, const int32_t ** rows, int64_t * stride) {
+    if (ggml_sycl_get_env("GGML_SYCL_SKIPCONV", 0) == 0) {
+        return false;
+    }
+    if (!st || !data || !rows || !stride) {
+        return false;
+    }
+    const ggml_tensor * t = st;
+    while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE ||
+                 t->op == GGML_OP_TRANSPOSE)) {
+        t = t->view_src ? t->view_src : t->src[0];
+    }
+    if (!t || t->op != GGML_OP_GET_ROWS || !t->src[0] || !t->src[1]) {
+        return false;
+    }
+    if (t->src[0]->type != GGML_TYPE_F32 || t->src[1]->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (t->src[0]->nb[0] != sizeof(float) || (t->src[0]->nb[1] % sizeof(float)) != 0) {
+        return false;
+    }
+    *data   = (const float *) t->src[0]->data;
+    *rows   = (const int32_t *) t->src[1]->data;
+    *stride = (int64_t) (t->src[0]->nb[1] / sizeof(float));
+    return *data && *rows && *stride > 0;
+}
+
 bool ggml_sycl_ssm_conv_can_split(const ggml_tensor * ssm) {
     if (!ssm || ssm->op != GGML_OP_SSM_CONV || !ssm->src[0] || !ssm->src[1]) {
         return false;
@@ -184,6 +211,100 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
 
     if (!g_ggml_sycl_enable_fusion) {
         return false;
+    }
+
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ROPE && ops.begin()[1] == GGML_OP_VIEW &&
+        ops.begin()[2] == GGML_OP_SET_ROWS) {
+        if (ggml_sycl_get_env("GGML_SYCL_FUSE_ROPE_SET", 0) == 0) {
+            return false;
+        }
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
+            return false;
+        }
+        const ggml_tensor * rope     = cgraph->nodes[node_idx];
+        const ggml_tensor * view     = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * set_rows = cgraph->nodes[node_idx + 2];
+        if (!rope->src[0] || rope->src[0]->ne[3] != 1) {
+            return false;
+        }
+        if (set_rows->type != GGML_TYPE_F32 && set_rows->type != GGML_TYPE_F16) {
+            return false;
+        }
+        if (!set_rows->src[1] || set_rows->src[1]->type != GGML_TYPE_I64) {
+            return false;
+        }
+        if (!ggml_is_contiguous(view) || view->ne[0] != rope->ne[0] * rope->ne[1]) {
+            return false;
+        }
+        if (view->src[0] != rope || set_rows->src[0] != view) {
+            return false;
+        }
+        const int mode = ((const int32_t *) rope->op_params)[2];
+        if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+            return false;
+        }
+        return true;
+    }
+
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_CONT && ops.begin()[1] == GGML_OP_UNARY &&
+        ops.begin()[2] == GGML_OP_MUL && unary_ops.size() == 1 &&
+        (unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID || unary_ops.begin()[0] == GGML_UNARY_OP_SILU)) {
+        if (ggml_sycl_get_env("GGML_SYCL_FUSE_CONT_UNARY", 0) == 0 ||
+            ggml_sycl_get_env("GGML_SYCL_FUSE_CONT_UNARY_MUL", 0) == 0) {
+            return false;
+        }
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
+            return false;
+        }
+        const ggml_tensor * cont = cgraph->nodes[node_idx];
+        const ggml_tensor * un   = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul  = cgraph->nodes[node_idx + 2];
+        if (ggml_get_unary_op(un) != unary_ops.begin()[0] || un->src[0] != cont) {
+            return false;
+        }
+        const ggml_tensor * other = (mul->src[0] == un) ? mul->src[1] : ((mul->src[1] == un) ? mul->src[0] : nullptr);
+        if (!other || other == un) {
+            return false;
+        }
+        if (cont->type != GGML_TYPE_F32 || un->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            !cont->src[0] || cont->src[0]->type != GGML_TYPE_F32 || other->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_is_contiguous(un) || !ggml_is_contiguous(mul) || !ggml_is_contiguous(other) ||
+            !ggml_are_same_shape(cont, un) || !ggml_are_same_shape(other, mul) || !ggml_are_same_shape(un, mul)) {
+            return false;
+        }
+        if (ggml_nelements(mul) < 1024 || ggml_nelements(mul) != ggml_nelements(cont->src[0])) {
+            return false;
+        }
+        return true;
+    }
+
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_CONT && ops.begin()[1] == GGML_OP_UNARY &&
+        unary_ops.size() == 1 &&
+        (unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID || unary_ops.begin()[0] == GGML_UNARY_OP_SILU)) {
+        if (ggml_sycl_get_env("GGML_SYCL_FUSE_CONT_UNARY", 0) == 0) {
+            return false;
+        }
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 1 })) {
+            return false;
+        }
+        const ggml_tensor * cont = cgraph->nodes[node_idx];
+        const ggml_tensor * un   = cgraph->nodes[node_idx + 1];
+        if (ggml_get_unary_op(un) != unary_ops.begin()[0] || un->src[0] != cont) {
+            return false;
+        }
+        if (cont->type != GGML_TYPE_F32 || un->type != GGML_TYPE_F32 ||
+            !cont->src[0] || cont->src[0]->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_is_contiguous(un) || !ggml_are_same_shape(cont, un)) {
+            return false;
+        }
+        if (ggml_nelements(un) < 1024) {
+            return false;
+        }
+        return true;
     }
 
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_UNARY &&

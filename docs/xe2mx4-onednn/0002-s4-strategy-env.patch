@@ -1,0 +1,42 @@
+From 22a4e598db35aece8fa3c4375d3e5d79c6a38ce8 Mon Sep 17 00:00:00 2001
+From: Cesar Salinas <138535492+cesarsal1nas@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 21:23:35 -0600
+Subject: [PATCH 2/2] fast_s4: optional S44_STRAT_EXTRA appended to the s4.s4
+ strategy; print the chosen strategy
+
+---
+ src/gpu/intel/gemm/jit/gen_kernel.cpp | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/src/gpu/intel/gemm/jit/gen_kernel.cpp b/src/gpu/intel/gemm/jit/gen_kernel.cpp
+index 254d1f7..1586dcb 100644
+--- a/src/gpu/intel/gemm/jit/gen_kernel.cpp
++++ b/src/gpu/intel/gemm/jit/gen_kernel.cpp
+@@ -174,14 +174,19 @@ status_t gen_desc_t::finalize(const char *tags) {
+             strategy_ = GEMMStrategy(hw_, stepping_);
+             strategy_.unroll[LoopM] = 32;
+             strategy_.unroll[LoopN] = 32;
+-            parseStrategy(
+-                    "at32+m128@96 am64+m64@112 aB wg 4x8 st li sr br sb128 bk0 sm sn grf256 sys",
+-                    hw_, problem_, strategy_);
++            std::string fs4 = "at32+m128@96 am64+m64@112 aB wg 4x8 st li sr br sb128 bk0 sm sn grf256 sys";
++            if (const char *ex = std::getenv("S44_STRAT_EXTRA")) {
++                if (ex[0]) {
++                    fs4 += " ";
++                    fs4 += ex;
++                }
++            }
++            parseStrategy(fs4.c_str(), hw_, problem_, strategy_);
+             static int nfast = 0;
+             if (nfast < 6) {
+                 nfast++;
+-                std::fprintf(stderr, "gemm fast s4 m=%ld n=%ld k=%ld\n",
+-                        (long) m_, (long) n_, (long) k_);
++                std::fprintf(stderr, "gemm fast s4 m=%ld n=%ld k=%ld strat=%s\n",
++                        (long) m_, (long) n_, (long) k_, fs4.c_str());
+                 std::fflush(stderr);
+             }
+         } else {
+-- 
+2.47.3
+

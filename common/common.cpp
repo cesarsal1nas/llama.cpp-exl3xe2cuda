@@ -1548,6 +1548,15 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         if (llama_model_has_decoder(model)) {
             llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
         }
+        // s4 oneDNN kernels are generated on the first M=ubatch GEMM. Do that here,
+        // before the server accepts, so the timed request does not pay the compile.
+        if (std::getenv("GGML_SYCL_XE2MX_PREFILL_WARM") && llama_model_has_decoder(model)) {
+            const int nwarm = std::max(params.n_ubatch, 32);
+            if (nwarm > (int) tmp.size()) {
+                std::vector<llama_token> big((size_t) nwarm, tmp[0]);
+                llama_decode(lctx, llama_batch_get_one(big.data(), big.size()));
+            }
+        }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);

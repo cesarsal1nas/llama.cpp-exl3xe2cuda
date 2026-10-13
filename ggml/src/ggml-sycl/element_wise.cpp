@@ -2,6 +2,7 @@
 #include "ggml-sycl/presets.hpp"
 #include "ggml.h"
 #include "element_wise.hpp"
+#include "xe2mx-a8.hpp"
 
 #define SYCL_GLOBAL_ID_LOOP(K, ITEM) \
     for (auto i = ITEM.get_global_id(0); i < (size_t)K; i += ITEM.get_global_range(0))
@@ -438,6 +439,27 @@ static void unary_mul_sycl(const T * x, const T * g, T * dst, const int64_t k, c
 
     // o0 == o1 == n makes (i/n)*o0 + (i%n) == i, so the strided kernel degenerates to the flat one
     if (o0 == n && o1 == n) {
+        if constexpr (std::is_same_v<T, float>) {
+            if ((k % 4) == 0) {
+                const int64_t k4 = k / 4;
+                const size_t nblk4 = ceil_div((size_t) k4, (size_t) SYCL_GLU_BLOCK_SIZE);
+                const sycl::nd_range<1> range4(nblk4 * sycl::range<1>(SYCL_GLU_BLOCK_SIZE),
+                                               sycl::range<1>(SYCL_GLU_BLOCK_SIZE));
+                main_stream->parallel_for(range4, [=](sycl::nd_item<1> item_ct1) {
+                    SYCL_GLOBAL_ID_LOOP(k4, item_ct1) {
+                        const size_t base = (size_t) i * 4;
+                        const sycl::float4 xv = *reinterpret_cast<const sycl::float4 *>(x + base);
+                        const sycl::float4 gv = *reinterpret_cast<const sycl::float4 *>(g + base);
+                        *reinterpret_cast<sycl::float4 *>(dst + base) = sycl::float4(
+                            (float) (op(xv.x()) * gv.x()),
+                            (float) (op(xv.y()) * gv.y()),
+                            (float) (op(xv.z()) * gv.z()),
+                            (float) (op(xv.w()) * gv.w()));
+                    }
+                });
+                return;
+            }
+        }
         main_stream->parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
             unary_mul_flat_kernel(x, g, dst, k, item_ct1, op);
         });
@@ -990,6 +1012,20 @@ static inline void ggml_sycl_op_reglu(ggml_backend_sycl_context & ctx, ggml_tens
 }
 
 static inline void ggml_sycl_op_swiglu(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (src0 && src1 && dst->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32
+        && ggml_is_contiguous(dst) && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)
+        && ggml_get_op_params_i32(dst, 1) == 0 && dst->ne[2] == 1 && dst->ne[3] == 1
+        && dst->ne[0] >= 1024 && (dst->ne[0] % 1024) == 0 && ggml_nrows(dst) >= 32
+        && src0->ne[0] == dst->ne[0] && src1->ne[0] == dst->ne[0]) {
+        dpct::queue_ptr stream = ctx.stream();
+        SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+        if (ggml_sycl_xe2mx_s44_silu_hilp(stream, dst, (const float *) src0->data, (const float *) src1->data,
+                                          (float *) dst->data, ggml_nrows(dst), dst->ne[0])) {
+            return;
+        }
+    }
     ggml_sycl_detail::ggml_sycl_op_unary_gated(ctx, dst, [](auto x) {
         return op_silu(x);
     });
@@ -1334,6 +1370,151 @@ void ggml_sycl_relu(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 void ggml_sycl_sigmoid(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
     ggml_sycl_op_sigmoid(ctx, dst);
+}
+
+void ggml_sycl_unary_from(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const ggml_tensor * src) {
+    GGML_ASSERT(dst && src);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src));
+    const ggml_unary_op uop = ggml_get_unary_op(dst);
+    GGML_ASSERT(uop == GGML_UNARY_OP_SIGMOID || uop == GGML_UNARY_OP_SILU);
+    const float * s = (const float *) src->data;
+    float * d = (float *) dst->data;
+    const int64_t k = ggml_nelements(dst);
+    const uint32_t ne0 = (uint32_t) src->ne[0];
+    const uint32_t ne1 = (uint32_t) src->ne[1];
+    const uint32_t ne2 = (uint32_t) src->ne[2];
+    const size_t s0 = src->nb[0] / sizeof(float);
+    const size_t s1 = src->nb[1] / sizeof(float);
+    const size_t s2 = src->nb[2] / sizeof(float);
+    const size_t s3 = src->nb[3] / sizeof(float);
+    const int silu = (uop == GGML_UNARY_OP_SILU) ? 1 : 0;
+    dpct::queue_ptr stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    const bool vec = (s0 == 1 && (ne0 % 4u) == 0 && (k % 4) == 0);
+    if (vec) {
+        const int64_t k4 = k / 4;
+        const int nblk = (int) ceil_div((int) k4, 256);
+        stream->parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) nblk) * sycl::range<1>(256), sycl::range<1>(256)),
+            [=](sycl::nd_item<1> it) {
+                SYCL_GLOBAL_ID_LOOP(k4, it) {
+                    const uint32_t base = (uint32_t) i * 4u;
+                    uint32_t t = base;
+                    const uint32_t i0 = t % ne0;
+                    t /= ne0;
+                    const uint32_t i1 = t % ne1;
+                    t /= ne1;
+                    const uint32_t i2 = t % ne2;
+                    const uint32_t i3 = t / ne2;
+                    const size_t off = (size_t) i0 * s0 + (size_t) i1 * s1 + (size_t) i2 * s2 + (size_t) i3 * s3;
+                    const sycl::float4 x = *reinterpret_cast<const sycl::float4 *>(s + off);
+                    sycl::float4 y;
+                    if (silu) {
+                        y = sycl::float4(op_silu(x.x()), op_silu(x.y()), op_silu(x.z()), op_silu(x.w()));
+                    } else {
+                        y = sycl::float4(op_sigmoid(x.x()), op_sigmoid(x.y()), op_sigmoid(x.z()), op_sigmoid(x.w()));
+                    }
+                    *reinterpret_cast<sycl::float4 *>(d + base) = y;
+                }
+            });
+        return;
+    }
+    const int nblk = (int) ceil_div((int) k, 256);
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) nblk) * sycl::range<1>(256), sycl::range<1>(256)),
+        [=](sycl::nd_item<1> it) {
+            SYCL_GLOBAL_ID_LOOP(k, it) {
+                uint32_t t = (uint32_t) i;
+                const uint32_t i0 = t % ne0;
+                t /= ne0;
+                const uint32_t i1 = t % ne1;
+                t /= ne1;
+                const uint32_t i2 = t % ne2;
+                const uint32_t i3 = t / ne2;
+                const float x = s[(size_t) i0 * s0 + (size_t) i1 * s1 + (size_t) i2 * s2 + (size_t) i3 * s3];
+                d[i] = silu ? op_silu(x) : op_sigmoid(x);
+            }
+        });
+}
+
+void ggml_sycl_unary_mul_from(ggml_backend_sycl_context & ctx, ggml_tensor * unary, const ggml_tensor * src,
+                              ggml_tensor * mul) {
+    GGML_ASSERT(unary && src && mul);
+    GGML_ASSERT(unary->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(mul));
+    GGML_ASSERT(ggml_nelements(mul) == ggml_nelements(src));
+    GGML_ASSERT(ggml_nelements(mul) == ggml_nelements(unary));
+    const ggml_unary_op uop = ggml_get_unary_op(unary);
+    GGML_ASSERT(uop == GGML_UNARY_OP_SIGMOID || uop == GGML_UNARY_OP_SILU);
+    const ggml_tensor * other = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
+    GGML_ASSERT(other && other != unary && other->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(other));
+    GGML_ASSERT(ggml_are_same_shape(other, mul));
+    const float * s = (const float *) src->data;
+    const float * g = (const float *) other->data;
+    float * d = (float *) mul->data;
+    const int64_t k = ggml_nelements(mul);
+    const uint32_t ne0 = (uint32_t) src->ne[0];
+    const uint32_t ne1 = (uint32_t) src->ne[1];
+    const uint32_t ne2 = (uint32_t) src->ne[2];
+    const size_t s0 = src->nb[0] / sizeof(float);
+    const size_t s1 = src->nb[1] / sizeof(float);
+    const size_t s2 = src->nb[2] / sizeof(float);
+    const size_t s3 = src->nb[3] / sizeof(float);
+    const int silu = (uop == GGML_UNARY_OP_SILU) ? 1 : 0;
+    dpct::queue_ptr stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    const bool vec = (s0 == 1 && (ne0 % 4u) == 0 && (k % 4) == 0);
+    if (vec) {
+        const int64_t k4 = k / 4;
+        const int nblk = (int) ceil_div((int) k4, 256);
+        stream->parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) nblk) * sycl::range<1>(256), sycl::range<1>(256)),
+            [=](sycl::nd_item<1> it) {
+                SYCL_GLOBAL_ID_LOOP(k4, it) {
+                    const uint32_t base = (uint32_t) i * 4u;
+                    uint32_t t = base;
+                    const uint32_t i0 = t % ne0;
+                    t /= ne0;
+                    const uint32_t i1 = t % ne1;
+                    t /= ne1;
+                    const uint32_t i2 = t % ne2;
+                    const uint32_t i3 = t / ne2;
+                    const size_t off = (size_t) i0 * s0 + (size_t) i1 * s1 + (size_t) i2 * s2 + (size_t) i3 * s3;
+                    const sycl::float4 x = *reinterpret_cast<const sycl::float4 *>(s + off);
+                    const sycl::float4 gv = *reinterpret_cast<const sycl::float4 *>(g + base);
+                    sycl::float4 y;
+                    if (silu) {
+                        y = sycl::float4(op_silu(x.x()) * gv.x(), op_silu(x.y()) * gv.y(), op_silu(x.z()) * gv.z(),
+                                         op_silu(x.w()) * gv.w());
+                    } else {
+                        y = sycl::float4(op_sigmoid(x.x()) * gv.x(), op_sigmoid(x.y()) * gv.y(),
+                                         op_sigmoid(x.z()) * gv.z(), op_sigmoid(x.w()) * gv.w());
+                    }
+                    *reinterpret_cast<sycl::float4 *>(d + base) = y;
+                }
+            });
+        return;
+    }
+    const int nblk = (int) ceil_div((int) k, 256);
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) nblk) * sycl::range<1>(256), sycl::range<1>(256)),
+        [=](sycl::nd_item<1> it) {
+            SYCL_GLOBAL_ID_LOOP(k, it) {
+                uint32_t t = (uint32_t) i;
+                const uint32_t i0 = t % ne0;
+                t /= ne0;
+                const uint32_t i1 = t % ne1;
+                t /= ne1;
+                const uint32_t i2 = t % ne2;
+                const uint32_t i3 = t / ne2;
+                const float x = s[(size_t) i0 * s0 + (size_t) i1 * s1 + (size_t) i2 * s2 + (size_t) i3 * s3];
+                const float y = silu ? op_silu(x) : op_sigmoid(x);
+                d[i] = y * g[i];
+            }
+        });
 }
 
 void ggml_sycl_hardsigmoid(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {

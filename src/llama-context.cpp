@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -1187,6 +1188,7 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+    sched_need_reserve = true;
 }
 
 void llama_context::set_mtp_skip_lm_head(bool value) {
@@ -1236,6 +1238,8 @@ bool llama_context::init_mtp_head_shortlist(int32_t n_short) {
 
     const int64_t n_embd  = src->ne[0];
     const int64_t n_vocab = src->ne[1];
+    const char * buft_name = src->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(src->buffer)) : "";
+    const bool meta_split = buft_name && strncmp(buft_name, "Meta(", 5) == 0;
     const char * q6k = getenv("MTP_HEAD_Q6K");
     const bool force_q6k = q6k && q6k[0] != '\0' && q6k[0] != '0';
     if ((int64_t) n_short >= n_vocab) {
@@ -1382,6 +1386,85 @@ bool llama_context::init_mtp_head_shortlist(int32_t n_short) {
                     __func__, rms0);
             return false;
         }
+    } else if (src->type == GGML_TYPE_Q8_0) {
+        const auto * tq8 = ggml_get_type_traits(GGML_TYPE_Q8_0);
+        if (!tq8 || !tq8->to_float || !tq6->from_float_ref) {
+            LLAMA_LOG_ERROR("%s: missing Q8_0/Q6_K traits for shortlist dump\n", __func__);
+            return false;
+        }
+        const size_t row_q8 = ggml_row_size(GGML_TYPE_Q8_0, n_embd);
+        const int64_t qk8 = ggml_blck_size(GGML_TYPE_Q8_0);
+        const size_t b8 = ggml_type_size(GGML_TYPE_Q8_0);
+        if (qk8 <= 0 || n_embd % qk8 != 0 || b8 == 0) {
+            LLAMA_LOG_ERROR("%s: bad q8_0 geometry qk=%ld n_embd=%ld\n",
+                    __func__, (long) qk8, (long) n_embd);
+            return false;
+        }
+        const int64_t nblocks_row8 = n_embd / qk8;
+        const int64_t nblocks_s8 = (int64_t) n_short * nblocks_row8;
+        bool packed_ok = ((size_t) src->nb[1] == row_q8);
+        if (packed_ok) {
+            std::vector<uint8_t> q8h((size_t) n_short * row_q8);
+            if (meta_split) {
+                packed_ok = ggml_backend_meta_get_leading(src, q8h.data(), q8h.size()) == q8h.size();
+            } else {
+                ggml_backend_tensor_get(src, q8h.data(), 0, q8h.size());
+            }
+            for (int32_t s = 0; s < n_short; ++s) {
+                tq8->to_float(q8h.data() + (size_t) s * row_q8, f32.data(), n_embd);
+                tq6->from_float_ref(f32.data(), src_h.data() + (size_t) s * row_q6, n_embd);
+            }
+            rms0 = row0_rms(src_h.data());
+            packed_ok = (rms0 > 1e-4 && rms0 < 1e2 && std::isfinite(rms0));
+        }
+        if (!packed_ok) {
+            const size_t qs_all = (size_t) n_embd * (size_t) n_vocab;
+            std::vector<uint8_t> qs((size_t) nblocks_s8 * (size_t) qk8);
+            std::vector<ggml_fp16_t> ds((size_t) nblocks_s8);
+            if (meta_split) {
+                std::vector<uint8_t> shard(ggml_nbytes(src));
+                const size_t got = ggml_backend_meta_get_leading(src, shard.data(), shard.size());
+                if (got == 0) {
+                    LLAMA_LOG_ERROR("%s: split q8_0 shortlist read failed\n", __func__);
+                    return false;
+                }
+                shard.resize(got);
+                const int64_t n_vocab_shard = (int64_t) (shard.size() / row_q8);
+                const int64_t nblocks_shard = n_vocab_shard * nblocks_row8;
+                const size_t qs_shard = (size_t) nblocks_shard * (size_t) qk8;
+                if ((int64_t) n_short > n_vocab_shard || shard.size() < qs_shard + ds.size() * sizeof(ggml_fp16_t)) {
+                    LLAMA_LOG_ERROR("%s: split q8_0 shard too small for S=%d\n", __func__, n_short);
+                    return false;
+                }
+                std::memcpy(qs.data(), shard.data(), qs.size());
+                std::memcpy(ds.data(), shard.data() + qs_shard, ds.size() * sizeof(ggml_fp16_t));
+            } else {
+                ggml_backend_tensor_get(src, qs.data(), 0, qs.size());
+                ggml_backend_tensor_get(src, ds.data(), qs_all, ds.size() * sizeof(ggml_fp16_t));
+            }
+            std::vector<uint8_t> packed((size_t) row_q8);
+            for (int32_t s = 0; s < n_short; ++s) {
+                for (int64_t b = 0; b < nblocks_row8; ++b) {
+                    const int64_t ib = (int64_t) s * nblocks_row8 + b;
+                    uint8_t * blk = packed.data() + (size_t) b * b8;
+                    std::memcpy(blk, &ds[(size_t) ib], sizeof(ggml_fp16_t));
+                    std::memcpy(blk + sizeof(ggml_fp16_t), qs.data() + (size_t) ib * (size_t) qk8, (size_t) qk8);
+                }
+                tq8->to_float(packed.data(), f32.data(), n_embd);
+                tq6->from_float_ref(f32.data(), src_h.data() + (size_t) s * row_q6, n_embd);
+            }
+            rms0 = row0_rms(src_h.data());
+            if (!(rms0 > 1e-4 && rms0 < 1e2 && std::isfinite(rms0))) {
+                LLAMA_LOG_ERROR("%s: q8_0 shortlist row0 RMS %g garbage; not enabling\n",
+                        __func__, rms0);
+                return false;
+            }
+            LLAMA_LOG_INFO("%s: q8_0 SOA dump Q6_K S=%d / %d row0 RMS %g\n",
+                    __func__, n_short, (int) n_vocab, rms0);
+        } else {
+            LLAMA_LOG_INFO("%s: q8_0 packed dump Q6_K S=%d / %d row0 RMS %g\n",
+                    __func__, n_short, (int) n_vocab, rms0);
+        }
     } else if (src->type != GGML_TYPE_Q6_K) {
         LLAMA_LOG_ERROR("%s: shortlist wants Q6_K or EXL3 src, got %s\n",
                 __func__, ggml_type_name(src->type));
@@ -1411,7 +1494,14 @@ bool llama_context::init_mtp_head_shortlist(int32_t n_short) {
         // Device output.weight is already Q6_K SoA by MTP ctor (row0 packed-dequant
         // RMS ~1e7). Prefix memcpy is not "first S packed rows". Unpack SoA planes
         // back to packed Q6_K; first mul_mat then SoA-reorders the shortlist.
-        ggml_backend_tensor_get(src, src_h.data(), 0, src_h.size());
+        if (meta_split) {
+            if (ggml_backend_meta_get_leading(src, src_h.data(), src_h.size()) != src_h.size()) {
+                LLAMA_LOG_ERROR("%s: split Q6_K shortlist read failed\n", __func__);
+                return false;
+            }
+        } else {
+            ggml_backend_tensor_get(src, src_h.data(), 0, src_h.size());
+        }
         rms0 = row0_rms(src_h.data());
         soa = !(rms0 > 1e-4 && rms0 < 1e2 && std::isfinite(rms0));
     }
@@ -1826,6 +1916,7 @@ static void copy_logits_rows(
     if (n_cols == n_vocab) {
         ggml_backend_tensor_get_async(backend, t_logits, logits_out, 0,
                 (size_t) n_outputs * n_vocab * sizeof(float));
+        ggml_backend_synchronize(backend);
         return;
     }
     GGML_ASSERT(n_cols > 0 && n_cols < n_vocab);
@@ -2227,11 +2318,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         break;
     }
 
-    // reserve output buffer
-    if (output_reserve(n_outputs_all) < n_outputs_all) {
-        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
+    if (output_reserve(n_outputs_all) < n_outputs_all ||
+            (cparams.embeddings_nextn && embd_nextn.data == nullptr)) {
+        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs (nextn=%d)\n",
+                __func__, n_outputs_all, (int) cparams.embeddings_nextn);
         return -2;
-    };
+    }
 
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
@@ -2539,36 +2631,27 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
     if (!buf_output || prev_size < new_size) {
-        if (buf_output) {
 #ifndef NDEBUG
-            // This doesn't happen often, but may be annoying in some cases (like the HellaSwag benchmark)
+        if (buf_output) {
             LLAMA_LOG_DEBUG("%s: reallocating output buffer from size %.02f MiB to %.02f MiB\n", __func__, prev_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
-#endif
-            synchronize();
-
-            // TODO: not needed?
-            buf_output = nullptr;
-            logits.data = nullptr;
-            embd.data = nullptr;
-            embd_nextn.data = nullptr;
-            for (auto & layer_inp : embd_layer_inp) {
-                layer_inp = {nullptr, 0};
-            }
         }
-
+#endif
         auto * buft = ggml_backend_cpu_buffer_type();
-        // try to use the host buffer of the device where the output tensor is allocated for faster transfer to system memory
         auto * output_dev = model.dev_output();
         auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
         if (output_dev_host_buft) {
             buft = output_dev_host_buft;
         }
-        buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
-        if (buf_output == nullptr) {
+        ggml_backend_buffer_ptr buf_new(ggml_backend_buft_alloc_buffer(buft, new_size));
+        if (buf_new == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
             return 0;
         }
-        ggml_backend_buffer_clear(buf_output.get(), 0);
+        if (buf_output) {
+            synchronize();
+        }
+        ggml_backend_buffer_clear(buf_new.get(), 0);
+        buf_output = std::move(buf_new);
     }
 
     float * output_base = (float *) ggml_backend_buffer_get_base(buf_output.get());
@@ -2898,6 +2981,28 @@ ggml_cgraph * llama_context::graph_reserve(
         GGML_ASSERT(!sizes);
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         return nullptr;
+    }
+
+    if (getenv("LLAMA_RESERVE_DUMP")) {
+        const size_t min_bytes = (size_t) 16 << 20;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const ggml_tensor * t = ggml_graph_node(gf, i);
+            const ggml_tensor * base = t->view_src ? t->view_src : t;
+            if (t->view_src == nullptr && ggml_nbytes(base) >= min_bytes) {
+                LLAMA_LOG_INFO("reserve_dump node %4d %-28s %-12s %s [%lld %lld %lld %lld] %.1f MiB\n", i, t->name,
+                    ggml_op_desc(t), ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1],
+                    (long long) t->ne[2], (long long) t->ne[3], ggml_nbytes(t) / 1048576.0);
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * l = t->src[s];
+                if (l && l->op == GGML_OP_NONE && l->buffer == nullptr && l->view_src == nullptr
+                    && ggml_nbytes(l) >= min_bytes) {
+                    LLAMA_LOG_INFO("reserve_dump input %-28s %s [%lld %lld %lld %lld] %.1f MiB\n", l->name,
+                        ggml_type_name(l->type), (long long) l->ne[0], (long long) l->ne[1],
+                        (long long) l->ne[2], (long long) l->ne[3], ggml_nbytes(l) / 1048576.0);
+                }
+            }
+        }
     }
 
     return gf;
