@@ -1,0 +1,1263 @@
+From ace5e2940c913bd0935eefa1c42d12d3d2d83a9f Mon Sep 17 00:00:00 2001
+From: Cesar Salinas <138535492+cesarsal1nas@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 21:48:41 -0600
+Subject: [PATCH] xe2mx4: debug prints only with ONEDNN_XE2MX4_DEBUG
+
+---
+ src/gpu/intel/gemm/jit.hpp                    |  20 ++-
+ src/gpu/intel/gemm/jit/gen_kernel.cpp         |  26 ++-
+ .../gemm/jit/generator/pieces/c_update.cxx    |  12 +-
+ .../intel/gemm/jit/generator/pieces/copy.cxx  |  14 +-
+ .../gemm/jit/generator/pieces/copy_plan.cpp   |  14 +-
+ .../gemm/jit/generator/pieces/gemm_setup.cxx  |  34 ++--
+ .../gemm/jit/generator/pieces/k_loop.cxx      |  26 ++-
+ .../jit/generator/pieces/matrix_access.cxx    | 148 ++++++++++--------
+ .../jit/generator/pieces/quantization.cxx     |  24 ++-
+ .../generator/pieces/register_allocation.cxx  |  12 +-
+ 10 files changed, 215 insertions(+), 115 deletions(-)
+
+diff --git a/src/gpu/intel/gemm/jit.hpp b/src/gpu/intel/gemm/jit.hpp
+index 92e48fe..e93727d 100644
+--- a/src/gpu/intel/gemm/jit.hpp
++++ b/src/gpu/intel/gemm/jit.hpp
+@@ -34,6 +34,16 @@
+ #include "gpu/intel/gemm/jit/pd.hpp"
+ #include "gpu/intel/gemm/primitive.hpp"
+ 
++#ifndef XE2MX4_DPRINTF
++#include <cstdio>
++#include <cstdlib>
++#define XE2MX4_DPRINTF(...) \
++    do { \
++        static const bool xe2mx4_dbg_on_ = std::getenv("ONEDNN_XE2MX4_DEBUG") != nullptr; \
++        if (xe2mx4_dbg_on_) std::fprintf(stderr, __VA_ARGS__); \
++    } while (0)
++#endif
++
+ namespace dnnl {
+ namespace impl {
+ namespace gpu {
+@@ -389,13 +399,13 @@ struct gen_t : public primitive_t {
+                 static int nent = 0;
+                 if (nent < 6) {
+                     nent++;
+-                    std::fprintf(stderr,
++                    XE2MX4_DPRINTF(
+                             "gemm entries=%zu a=%d b=%d swap=%d m=%ld n=%ld k=%ld\n",
+                             entries.size(), (int)eff_a_type(), (int)eff_b_type(),
+                             (int)swap_ab(), (long)eff_m(), (long)eff_n(),
+                             (long)d->k());
+                     for (size_t ei = 0; ei < entries.size() && ei < 2; ei++) {
+-                        std::fprintf(stderr, "gemm ent %s\n", entries[ei]->strategy);
++                        XE2MX4_DPRINTF( "gemm ent %s\n", entries[ei]->strategy);
+                     }
+                     std::fflush(stderr);
+                 }
+@@ -450,7 +460,7 @@ struct gen_t : public primitive_t {
+                     static int nfin = 0;
+                     if (nfin < 4) {
+                         nfin++;
+-                        std::fprintf(stderr, "gemm finalize status=%d\n",
++                        XE2MX4_DPRINTF( "gemm finalize status=%d\n",
+                                 (int)status);
+                         std::fflush(stderr);
+                     }
+@@ -527,7 +537,7 @@ struct gen_t : public primitive_t {
+                         static int ntc = 0;
+                         if (ntc < 24) {
+                             ntc++;
+-                            std::fprintf(stderr, "gemm try_create status=%d %s\n",
++                            XE2MX4_DPRINTF( "gemm try_create status=%d %s\n",
+                                     (int)status,
+                                     kernel_desc_.entry().str().c_str());
+                             std::fflush(stderr);
+@@ -537,7 +547,7 @@ struct gen_t : public primitive_t {
+                         static int nwin = 0;
+                         if (nwin < 8) {
+                             nwin++;
+-                            std::fprintf(stderr, "gemm try_create OK %s\n",
++                            XE2MX4_DPRINTF( "gemm try_create OK %s\n",
+                                     kernel_desc_.entry().str().c_str());
+                             std::fflush(stderr);
+                         }
+diff --git a/src/gpu/intel/gemm/jit/gen_kernel.cpp b/src/gpu/intel/gemm/jit/gen_kernel.cpp
+index 1586dcb..c3d19d3 100644
+--- a/src/gpu/intel/gemm/jit/gen_kernel.cpp
++++ b/src/gpu/intel/gemm/jit/gen_kernel.cpp
+@@ -36,6 +36,16 @@
+ #include "kernel_evaluator.hpp"
+ #include "kernel_selector.hpp"
+ 
++#ifndef XE2MX4_DPRINTF
++#include <cstdio>
++#include <cstdlib>
++#define XE2MX4_DPRINTF(...) \
++    do { \
++        static const bool xe2mx4_dbg_on_ = std::getenv("ONEDNN_XE2MX4_DEBUG") != nullptr; \
++        if (xe2mx4_dbg_on_) std::fprintf(stderr, __VA_ARGS__); \
++    } while (0)
++#endif
++
+ namespace dnnl {
+ namespace impl {
+ namespace gpu {
+@@ -185,7 +195,7 @@ status_t gen_desc_t::finalize(const char *tags) {
+             static int nfast = 0;
+             if (nfast < 6) {
+                 nfast++;
+-                std::fprintf(stderr, "gemm fast s4 m=%ld n=%ld k=%ld strat=%s\n",
++                XE2MX4_DPRINTF( "gemm fast s4 m=%ld n=%ld k=%ld strat=%s\n",
+                         (long) m_, (long) n_, (long) k_, fs4.c_str());
+                 std::fflush(stderr);
+             }
+@@ -306,7 +316,7 @@ status_t gen_desc_t::finalize(const char *tags) {
+         static int npf = 0;
+         if (npf < 6) {
+             npf++;
+-            std::fprintf(stderr,
++            XE2MX4_DPRINTF(
+                     "gemm preflight fail Ta=%c/%c Tb=%c/%c Tc=%c aqK=%d bqK=%d\n",
+                     typeToChar(problem_.Ta_ext), typeToChar(problem_.Ta),
+                     typeToChar(problem_.Tb_ext), typeToChar(problem_.Tb),
+@@ -320,14 +330,14 @@ status_t gen_desc_t::finalize(const char *tags) {
+     // Check for legal 2D quantization group size.
+     if (problem_.aOffset2D() || problem_.aScale2D())
+         if (problem_.aqGroupK % strategy_.aqGroupKGranularity()) {
+-            std::fprintf(stderr, "gemm aq gran %d %% %d\n", problem_.aqGroupK,
++            XE2MX4_DPRINTF( "gemm aq gran %d %% %d\n", problem_.aqGroupK,
+                     strategy_.aqGroupKGranularity());
+             std::fflush(stderr);
+             return status::unimplemented;
+         }
+     if (problem_.bOffset2D() || problem_.bScale2D())
+         if (problem_.bqGroupK % strategy_.bqGroupKGranularity()) {
+-            std::fprintf(stderr, "gemm bq gran %d %% %d\n", problem_.bqGroupK,
++            XE2MX4_DPRINTF( "gemm bq gran %d %% %d\n", problem_.bqGroupK,
+                     strategy_.bqGroupKGranularity());
+             std::fflush(stderr);
+             return status::unimplemented;
+@@ -336,7 +346,7 @@ status_t gen_desc_t::finalize(const char *tags) {
+             && problem_.aqGroupK
+                             % minOuterProductCount(hw_, problem_, strategy_)
+                     != 0) {
+-        std::fprintf(stderr, "gemm aq opc %d %% %d\n", problem_.aqGroupK,
++        XE2MX4_DPRINTF( "gemm aq opc %d %% %d\n", problem_.aqGroupK,
+                 minOuterProductCount(hw_, problem_, strategy_));
+         std::fflush(stderr);
+         return status::unimplemented;
+@@ -345,7 +355,7 @@ status_t gen_desc_t::finalize(const char *tags) {
+             && problem_.bqGroupK
+                             % minOuterProductCount(hw_, problem_, strategy_)
+                     != 0) {
+-        std::fprintf(stderr, "gemm bq opc %d %% %d\n", problem_.bqGroupK,
++        XE2MX4_DPRINTF( "gemm bq opc %d %% %d\n", problem_.bqGroupK,
+                 minOuterProductCount(hw_, problem_, strategy_));
+         std::fflush(stderr);
+         return status::unimplemented;
+@@ -1284,7 +1294,7 @@ status_t gen_kernel_t::get_kernel(
+         static int noor = 0;
+         if (noor < 4) {
+             noor++;
+-            std::fprintf(stderr, "gemm gen OOR %s\n", err.what());
++            XE2MX4_DPRINTF( "gemm gen OOR %s\n", err.what());
+             std::fflush(stderr);
+         }
+         VDEBUGINFO(1, primitive, gpu, "%s,%s,%s", "jit::gemm", err.what(),
+@@ -1294,7 +1304,7 @@ status_t gen_kernel_t::get_kernel(
+         static int nrt = 0;
+         if (nrt < 4) {
+             nrt++;
+-            std::fprintf(stderr, "gemm gen runtime %s\n", err.what());
++            XE2MX4_DPRINTF( "gemm gen runtime %s\n", err.what());
+             std::fflush(stderr);
+         }
+         VERROR(primitive, gpu, "%s,%s", "jit::gemm", err.what());
+diff --git a/src/gpu/intel/gemm/jit/generator/pieces/c_update.cxx b/src/gpu/intel/gemm/jit/generator/pieces/c_update.cxx
+index 9615d44..2591726 100644
+--- a/src/gpu/intel/gemm/jit/generator/pieces/c_update.cxx
++++ b/src/gpu/intel/gemm/jit/generator/pieces/c_update.cxx
+@@ -27,6 +27,16 @@
+ #include "ngen_object_helpers.hpp"
+ #include "state_utils.hpp"
+ 
++#ifndef XE2MX4_DPRINTF
++#include <cstdio>
++#include <cstdlib>
++#define XE2MX4_DPRINTF(...) \
++    do { \
++        static const bool xe2mx4_dbg_on_ = std::getenv("ONEDNN_XE2MX4_DEBUG") != nullptr; \
++        if (xe2mx4_dbg_on_) std::fprintf(stderr, __VA_ARGS__); \
++    } while (0)
++#endif
++
+ GEMMSTONE_NAMESPACE_START
+ 
+ using namespace ngen;
+@@ -55,7 +65,7 @@ bool Generator<hw>::gemmUpdateC(GEMMProblem &problem, GEMMStrategy &strategy, GE
+         static int ncu = 0;
+         if (ncu < 4) {
+             ncu++;
+-            std::fprintf(stderr, "C update alpha1=%d beta0=%d\n",
++            XE2MX4_DPRINTF( "C update alpha1=%d beta0=%d\n",
+                     (int)problem.alpha1(), (int)problem.beta0());
+             std::fflush(stderr);
+         }
+diff --git a/src/gpu/intel/gemm/jit/generator/pieces/copy.cxx b/src/gpu/intel/gemm/jit/generator/pieces/copy.cxx
+index 1ae4233..c80750e 100644
+--- a/src/gpu/intel/gemm/jit/generator/pieces/copy.cxx
++++ b/src/gpu/intel/gemm/jit/generator/pieces/copy.cxx
+@@ -24,6 +24,16 @@
+ #include <cstdio>
+ #include <cstdlib>
+ 
++#ifndef XE2MX4_DPRINTF
++#include <cstdio>
++#include <cstdlib>
++#define XE2MX4_DPRINTF(...) \
++    do { \
++        static const bool xe2mx4_dbg_on_ = std::getenv("ONEDNN_XE2MX4_DEBUG") != nullptr; \
++        if (xe2mx4_dbg_on_) std::fprintf(stderr, __VA_ARGS__); \
++    } while (0)
++#endif
++
+ GEMMSTONE_NAMESPACE_START
+ 
+ using namespace ngen;
+@@ -203,7 +213,7 @@ void Generator<hw>::copyRegisters(Type Ts, Type Td, const RegisterLayout &layout
+             static int nc4 = 0;
+             if (Td.is4() && nc4 < 8) {
+                 nc4++;
+-                std::fprintf(stderr, "copy4 n=%d ns=%d nd=%d so=%d.%d ss=%d do=%d.%d ds=%d vs=%d w=%d eoff=%d,%d ny=%d nx=%d\n",
++                XE2MX4_DPRINTF( "copy4 n=%d ns=%d nd=%d so=%d.%d ss=%d do=%d.%d ds=%d vs=%d w=%d eoff=%d,%d ny=%d nx=%d\n",
+                         n, ns, nd, sOp.grf, sOp.offset, (int) sOp.stride,
+                         dOp.grf, dOp.offset, (int) dOp.stride, (int) dOp.vs, (int) dOp.width,
+                         eoffR, eoffC, sblock.*ny, sblock.*nx);
+@@ -258,7 +268,7 @@ void Generator<hw>::copyRegisters(Type Ts, Type Td, const RegisterLayout &layout
+             s2.offset = 0;
+             n2 = std::min(n2, std::max(nd2, 1));
+             plan.append(Opcode::mov, n2, mod, d2, s2);
+-            std::fprintf(stderr, "copy4 pack n2=%d pgrf=%d dgrf=%d.%d eoffY=%d\n",
++            XE2MX4_DPRINTF( "copy4 pack n2=%d pgrf=%d dgrf=%d.%d eoffY=%d\n",
+                     n2, s2.grf, d2.grf, d2.offset, eoffY);
+             std::fflush(stderr);
+             }
+diff --git a/src/gpu/intel/gemm/jit/generator/pieces/copy_plan.cpp b/src/gpu/intel/gemm/jit/generator/pieces/copy_plan.cpp
+index aa08523..6b49382 100644
+--- a/src/gpu/intel/gemm/jit/generator/pieces/copy_plan.cpp
++++ b/src/gpu/intel/gemm/jit/generator/pieces/copy_plan.cpp
+@@ -24,6 +24,16 @@
+ #include <cstdio>
+ #include <cstdlib>
+ 
++#ifndef XE2MX4_DPRINTF
++#include <cstdio>
++#include <cstdlib>
++#define XE2MX4_DPRINTF(...) \
++    do { \
++        static const bool xe2mx4_dbg_on_ = std::getenv("ONEDNN_XE2MX4_DEBUG") != nullptr; \
++        if (xe2mx4_dbg_on_) std::fprintf(stderr, __VA_ARGS__); \
++    } while (0)
++#endif
++
+ GEMMSTONE_NAMESPACE_START
+ 
+ using namespace ngen;
+@@ -826,7 +836,7 @@ void CopyPlan::planTypeConversions()
+                 static int ncv = 0;
+                 if (ncv < 1) {
+                     ncv++;
+-                    std::fprintf(stderr, "F16A_CVT=%d\n", cv);
++                    XE2MX4_DPRINTF( "F16A_CVT=%d\n", cv);
+                     std::fflush(stderr);
+                 }
+             }
+@@ -1457,7 +1467,7 @@ void CopyPlan::planInt4Downconversion(CopyInstruction &i)
+         static int np = 0;
+         if (np < 8) {
+             np++;
+-            std::fprintf(stderr, "i4down simd=%d sat=%d st=%d dt=%d doff=%d dstr=%d dvs=%d dw=%d soff=%d sstr=%d\n",
++            XE2MX4_DPRINTF( "i4down simd=%d sat=%d st=%d dt=%d doff=%d dstr=%d dvs=%d dw=%d soff=%d sstr=%d\n",
+                     simd, (int) i.sat, (int) st, (int) dt,
+                     (int) i.dst.offset, (int) i.dst.stride, (int) i.dst.vs, (int) i.dst.width,
+                     (int) i.src0.offset, (int) i.src0.stride);
+diff --git a/src/gpu/intel/gemm/jit/generator/pieces/gemm_setup.cxx b/src/gpu/intel/gemm/jit/generator/pieces/gemm_setup.cxx
+index 02e786e..0079a95 100644
+--- a/src/gpu/intel/gemm/jit/generator/pieces/gemm_setup.cxx
++++ b/src/gpu/intel/gemm/jit/generator/pieces/gemm_setup.cxx
+@@ -27,6 +27,16 @@
+ #include <cstdio>
+ #include "token_alloc_utils.hpp"
+ 
++#ifndef XE2MX4_DPRINTF
++#include <cstdio>
++#include <cstdlib>
++#define XE2MX4_DPRINTF(...) \
++    do { \
++        static const bool xe2mx4_dbg_on_ = std::getenv("ONEDNN_XE2MX4_DEBUG") != nullptr; \
++        if (xe2mx4_dbg_on_) std::fprintf(stderr, __VA_ARGS__); \
++    } while (0)
++#endif
++
+ GEMMSTONE_NAMESPACE_START
+ 
+ using namespace ngen;
+@@ -1416,7 +1426,7 @@ bool Generator<hw>::gemmAccumulateCSetup(GEMMProblem &problem, GEMMStrategy &str
+                 static int nsl = 0;
+                 if (nsl < 8) {
+                     nsl++;
+-                    std::fprintf(stderr, "slmB enter kb=%d nb=%d ks=%d n=%d coop=%d cp=%d kbl=%d uk=%d\n",
++                    XE2MX4_DPRINTF( "slmB enter kb=%d nb=%d ks=%d n=%d coop=%d cp=%d kbl=%d uk=%d\n",
+                             state.kb_slm, state.nb_slm, unrollKSLM, unrollN,
+                             (int)state.effCoopB, B_slmCP, strategy.kb_load, unrollK);
+                     std::fflush(stderr);
+@@ -1451,7 +1461,7 @@ bool Generator<hw>::gemmAccumulateCSetup(GEMMProblem &problem, GEMMStrategy &str
+                 if (el && el[0])
+                     ldv = std::atoi(el);
+                 if (ldv != 0) {
+-                    std::fprintf(stderr, "F16A_LOAD=%d\n", ldv);
++                    XE2MX4_DPRINTF( "F16A_LOAD=%d\n", ldv);
+                     std::fflush(stderr);
+                     if (ldv >= 9 && ldv <= 101) {
+                         state.Bi_strategy.accessType = AccessType::Block2D;
+@@ -1526,7 +1536,7 @@ bool Generator<hw>::gemmAccumulateCSetup(GEMMProblem &problem, GEMMStrategy &str
+                 static int nbi = 0;
+                 if (nbi < 4) {
+                     nbi++;
+-                    std::fprintf(stderr, "slmB Bi ok regs=%d blkcp=%d nr=%d nc=%d cm=%d rows=%d cols=%d nbl=%d offR1=%d\n",
++                    XE2MX4_DPRINTF( "slmB Bi ok regs=%d blkcp=%d nr=%d nc=%d cm=%d rows=%d cols=%d nbl=%d offR1=%d\n",
+                             state.Bi_layout.regs(),
+                             state.Bi_layout.empty() ? -1 : state.Bi_layout[0].crosspack,
+                             state.Bi_layout.empty() ? -1 : state.Bi_layout[0].nr,
+@@ -1550,7 +1560,7 @@ bool Generator<hw>::gemmAccumulateCSetup(GEMMProblem &problem, GEMMStrategy &str
+                 static int nacc = 0;
+                 if (nacc < 4) {
+                     nacc++;
+-                    std::fprintf(stderr, "slmB Bo acc=%d cin=%d cslm=%d aln=%d cp=%d\n",
++                    XE2MX4_DPRINTF( "slmB Bo acc=%d cin=%d cslm=%d aln=%d cp=%d\n",
+                             (int)state.Bo_strategy.accessType, (int)colMajorIn, (int)colMajorSLM,
+                             (int)state.Bo.alignment, state.Bo.crosspack);
+                     std::fflush(stderr);
+@@ -1559,7 +1569,7 @@ bool Generator<hw>::gemmAccumulateCSetup(GEMMProblem &problem, GEMMStrategy &str
+             try {
+             CREATE_LAYOUT(state.Bo_layout, Tb, state.kb_slm, state.nb_slm, state.Bo, state.Bo_strategy, remK_B, remN_B, true);
+             } catch (...) {
+-                std::fprintf(stderr, "slmB Bo stub\n");
++                XE2MX4_DPRINTF( "slmB Bo stub\n");
+                 std::fflush(stderr);
+                 throw;
+             }
+@@ -1567,7 +1577,7 @@ bool Generator<hw>::gemmAccumulateCSetup(GEMMProblem &problem, GEMMStrategy &str
+                 static int nbo = 0;
+                 if (nbo < 4) {
+                     nbo++;
+-                    std::fprintf(stderr, "slmB Bo ok regs=%d blkcp=%d nr=%d nc=%d cm=%d eby=%d simd=%d cnt=%d\n",
++                    XE2MX4_DPRINTF( "slmB Bo ok regs=%d blkcp=%d nr=%d nc=%d cm=%d eby=%d simd=%d cnt=%d\n",
+                             state.Bo_layout.regs(),
+                             state.Bo_layout.empty() ? -1 : state.Bo_layout[0].crosspack,
+                             state.Bo_layout.empty() ? -1 : state.Bo_layout[0].nr,
+@@ -1593,7 +1603,7 @@ bool Generator<hw>::gemmAccumulateCSetup(GEMMProblem &problem, GEMMStrategy &str
+                 static int nsh = 0;
+                 if (nsh < 4) {
+                     nsh++;
+-                    std::fprintf(stderr, "slmB bioShare=%d Bi=%d Bo=%d\n",
++                    XE2MX4_DPRINTF( "slmB bioShare=%d Bi=%d Bo=%d\n",
+                             (int)state.bioShare, state.Bi_layout.regs(), state.Bo_layout.regs());
+                     std::fflush(stderr);
+                 }
+@@ -1701,7 +1711,7 @@ bool Generator<hw>::gemmAccumulateCSetup(GEMMProblem &problem, GEMMStrategy &str
+                             }
+                         }
+                     }
+-                    std::fprintf(stderr, "F16A_PTR 1d offR=%d offC=%d pmode=%d\n", (int) Bi_params.offR.isValid(), (int) Bi_params.offC.isValid(), pmode);
++                    XE2MX4_DPRINTF( "F16A_PTR 1d offR=%d offC=%d pmode=%d\n", (int) Bi_params.offR.isValid(), (int) Bi_params.offC.isValid(), pmode);
+                     std::fflush(stderr);
+                     if (ldv2 >= 61 && ldv2 <= 64)
+                         state.f16aPack = state.ra.allocRange(1);
+@@ -1779,7 +1789,7 @@ bool Generator<hw>::gemmAccumulateCSetup(GEMMProblem &problem, GEMMStrategy &str
+         static int npre = 0;
+         if (npre < 8) {
+             npre++;
+-            std::fprintf(stderr, "slmB preAB slm=%d ka=%d kb=%d cpB=%d pack=%d\n",
++            XE2MX4_DPRINTF( "slmB preAB slm=%d ka=%d kb=%d cpB=%d pack=%d\n",
+                     (int)slmB, strategy.ka_load, strategy.kb_load,
+                     problem.B.crosspack, problem.B.packSize);
+             std::fflush(stderr);
+@@ -1792,7 +1802,7 @@ bool Generator<hw>::gemmAccumulateCSetup(GEMMProblem &problem, GEMMStrategy &str
+         static int na = 0;
+         if (na < 8) {
+             na++;
+-            std::fprintf(stderr, "slmB A ok regs=%d blkcp=%d nr=%d nc=%d cm=%d\n",
++            XE2MX4_DPRINTF( "slmB A ok regs=%d blkcp=%d nr=%d nc=%d cm=%d\n",
+                     state.A_layout.regs(),
+                     state.A_layout.empty() ? -1 : state.A_layout[0].crosspack,
+                     state.A_layout.empty() ? -1 : state.A_layout[0].nr,
+@@ -1806,7 +1816,7 @@ bool Generator<hw>::gemmAccumulateCSetup(GEMMProblem &problem, GEMMStrategy &str
+         static int nabc = 0;
+         if (nabc < 8) {
+             nabc++;
+-            std::fprintf(stderr, "slmB B ok regs=%d kb=%d cpB=%d blkcp=%d nr=%d nc=%d cm=%d\n",
++            XE2MX4_DPRINTF( "slmB B ok regs=%d kb=%d cpB=%d blkcp=%d nr=%d nc=%d cm=%d\n",
+                     state.B_layout.regs(), strategy.kb_load, problem.B.crosspack,
+                     state.B_layout.empty() ? -1 : state.B_layout[0].crosspack,
+                     state.B_layout.empty() ? -1 : state.B_layout[0].nr,
+@@ -1956,7 +1966,7 @@ bool Generator<hw>::gemmAccumulateCSetup(GEMMProblem &problem, GEMMStrategy &str
+             static int ncr = 0;
+             if (ncr < 4) {
+                 ncr++;
+-                std::fprintf(stderr, "slmB Cr period=%d uk=%d Tc=%d Tcc=%d Cr=%d\n",
++                XE2MX4_DPRINTF( "slmB Cr period=%d uk=%d Tc=%d Tcc=%d Cr=%d\n",
+                         period, unrollK, (int)Tc, (int)Tc_compute, state.Cr_layout.regs());
+                 std::fflush(stderr);
+             }
+diff --git a/src/gpu/intel/gemm/jit/generator/pieces/k_loop.cxx b/src/gpu/intel/gemm/jit/generator/pieces/k_loop.cxx
+index 86523b8..d209f9a 100644
+--- a/src/gpu/intel/gemm/jit/generator/pieces/k_loop.cxx
++++ b/src/gpu/intel/gemm/jit/generator/pieces/k_loop.cxx
+@@ -27,6 +27,16 @@
+ #include <cstdlib>
+ #include "quantization.hpp"
+ 
++#ifndef XE2MX4_DPRINTF
++#include <cstdio>
++#include <cstdlib>
++#define XE2MX4_DPRINTF(...) \
++    do { \
++        static const bool xe2mx4_dbg_on_ = std::getenv("ONEDNN_XE2MX4_DEBUG") != nullptr; \
++        if (xe2mx4_dbg_on_) std::fprintf(stderr, __VA_ARGS__); \
++    } while (0)
++#endif
++
+ GEMMSTONE_NAMESPACE_START
+ 
+ using namespace ngen;
+@@ -1076,7 +1086,7 @@ void Generator<hw>::kLoop(KLoop type, const GEMMProblem &problem, GEMMStrategy &
+                 static int nop = 0;
+                 if (strategy.slmB && nop < 6) {
+                     nop++;
+-                    std::fprintf(stderr, "slmB op cpB=%d repack=%d Br=%d B=%d\n",
++                    XE2MX4_DPRINTF( "slmB op cpB=%d repack=%d Br=%d B=%d\n",
+                             layoutB.empty() ? -1 : layoutB[0].crosspack,
+                             (int)repackB(h), state.Br_layout.regs(), state.B_layout.regs());
+                     std::fflush(stderr);
+@@ -1256,7 +1266,7 @@ void Generator<hw>::kLoop(KLoop type, const GEMMProblem &problem, GEMMStrategy &
+             static int nst = 0;
+             if (nst < 4) {
+                 nst++;
+-                std::fprintf(stderr, "slmB store h=%d\n", (int)h);
++                XE2MX4_DPRINTF( "slmB store h=%d\n", (int)h);
+                 std::fflush(stderr);
+             }
+         }
+@@ -1285,7 +1295,7 @@ void Generator<hw>::kLoop(KLoop type, const GEMMProblem &problem, GEMMStrategy &
+                 static int nbo = 0;
+                 if (nbo < 4) {
+                     nbo++;
+-                    std::fprintf(stderr, "slmB store Bo empty=%d len=%d Bi=%d eff=%d naddr=%d\n",
++                    XE2MX4_DPRINTF( "slmB store Bo empty=%d len=%d Bi=%d eff=%d naddr=%d\n",
+                             (int)Bo_regs(h).empty(), Bo_regs(h).getLen(),
+                             Bi_regs(h).getLen(), (int)effBo_regs(h).empty(),
+                             (int)state.Bo_addrs.size());
+@@ -1316,7 +1326,7 @@ void Generator<hw>::kLoop(KLoop type, const GEMMProblem &problem, GEMMStrategy &
+                             static int ninc = 0;
+                             if (ninc < 1) {
+                                 ninc++;
+-                                std::fprintf(stderr, "F16A_KQ as2D=%d as2DLate=%d bs2D=%d aqg=%d bqg=%d kaqS=%d kbqS=%d Aregs=%d Bregs=%d slmBuf=%d uk=%d ukslm=%d\n",
++                                XE2MX4_DPRINTF( "F16A_KQ as2D=%d as2DLate=%d bs2D=%d aqg=%d bqg=%d kaqS=%d kbqS=%d Aregs=%d Bregs=%d slmBuf=%d uk=%d ukslm=%d\n",
+                                         (int) as2D, (int) as2DLate, (int) bs2D,
+                                         problem.aqGroupK, problem.bqGroupK,
+                                         state.kaqStride, state.kbqStride,
+@@ -1389,7 +1399,7 @@ void Generator<hw>::kLoop(KLoop type, const GEMMProblem &problem, GEMMStrategy &
+             static int nsd = 0;
+             if (nsd < 4) {
+                 nsd++;
+-                std::fprintf(stderr, "slmB stored h=%d sums=%d\n", (int)h, (int)slmBSums);
++                XE2MX4_DPRINTF( "slmB stored h=%d sums=%d\n", (int)h, (int)slmBSums);
+                 std::fflush(stderr);
+             }
+         }
+@@ -1489,7 +1499,7 @@ void Generator<hw>::kLoop(KLoop type, const GEMMProblem &problem, GEMMStrategy &
+         static int nlsu = 0;
+         if (nlsu < 4) {
+             nlsu++;
+-            std::fprintf(stderr, "F16A_LS unroll=%d cooldown=%d lsK=%d\n",
++            XE2MX4_DPRINTF( "F16A_LS unroll=%d cooldown=%d lsK=%d\n",
+                     ls.getUnroll(), ls.getCooldown(), unrollK);
+             std::fflush(stderr);
+         }
+@@ -1502,7 +1512,7 @@ void Generator<hw>::kLoop(KLoop type, const GEMMProblem &problem, GEMMStrategy &
+             static int nku = 0;
+             if (nku < 4) {
+                 nku++;
+-                std::fprintf(stderr, "slmB kunroll ls=%d k=%d\n", ls.getUnroll(), unrollK);
++                XE2MX4_DPRINTF( "slmB kunroll ls=%d k=%d\n", ls.getUnroll(), unrollK);
+                 std::fflush(stderr);
+             }
+             stub("k loop unroll mismatch");
+@@ -1940,7 +1950,7 @@ void Generator<hw>::gemmBLoad(const GRFMultirange &regs, const RegisterLayout &l
+         static int nbl = 0;
+         if (nbl < 40 && strategy.slmB) {
+             nbl++;
+-            std::fprintf(stderr, "slmB Bload regs=%d acc=%d r=%d c=%d eby=%d simd=%d cnt=%d naddr=%d\n",
++            XE2MX4_DPRINTF( "slmB Bload regs=%d acc=%d r=%d c=%d eby=%d simd=%d cnt=%d naddr=%d\n",
+                     layout.regs(), (int)layout.addressingStrategy().accessType,
+                     layout.rows(), layout.cols(),
+                     layout.empty() ? -1 : layout[0].ebytes,
+diff --git a/src/gpu/intel/gemm/jit/generator/pieces/matrix_access.cxx b/src/gpu/intel/gemm/jit/generator/pieces/matrix_access.cxx
+index c684ad5..5805aa3 100644
+--- a/src/gpu/intel/gemm/jit/generator/pieces/matrix_access.cxx
++++ b/src/gpu/intel/gemm/jit/generator/pieces/matrix_access.cxx
+@@ -22,6 +22,16 @@
+ #include "state_utils.hpp"
+ #include <cstdlib>
+ 
++#ifndef XE2MX4_DPRINTF
++#include <cstdio>
++#include <cstdlib>
++#define XE2MX4_DPRINTF(...) \
++    do { \
++        static const bool xe2mx4_dbg_on_ = std::getenv("ONEDNN_XE2MX4_DEBUG") != nullptr; \
++        if (xe2mx4_dbg_on_) std::fprintf(stderr, __VA_ARGS__); \
++    } while (0)
++#endif
++
+ GEMMSTONE_NAMESPACE_START
+ 
+ using namespace ngen;
+@@ -167,7 +177,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 int ndw = nbytes / 4;
+                 if (ndw > 16)
+                     ndw = 16;
+-                std::fprintf(stderr, "F16A_1D ld=%d w=%d h=%d ndw=%d\n", ld1, w, h, ndw);
++                XE2MX4_DPRINTF( "F16A_1D ld=%d w=%d h=%d ndw=%d\n", ld1, w, h, ndw);
+                 std::fflush(stderr);
+                 GRF th = state.ra.alloc();
+                 GRF tt = state.ra.alloc();
+@@ -193,7 +203,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 11 && count == 1 && w >= 16 && h > 0) {
+-                std::fprintf(stderr, "F16A_1D ld=11 w=%d h=%d split16\n", w, h);
++                XE2MX4_DPRINTF( "F16A_1D ld=11 w=%d h=%d split16\n", w, h);
+                 std::fflush(stderr);
+                 GRF th = state.ra.alloc();
+                 GRF t2 = state.ra.alloc();
+@@ -213,7 +223,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 12 && count == 1 && w >= 16 && h > 0) {
+-                std::fprintf(stderr, "F16A_1D ld=12 w=%d h=%d d32x16\n", w, h);
++                XE2MX4_DPRINTF( "F16A_1D ld=12 w=%d h=%d d32x16\n", w, h);
+                 std::fflush(stderr);
+                 GRF th = state.ra.alloc();
+                 auto spec32 = block_2d(D32, 16, 1, 1) | astrategy.cachingR;
+@@ -229,7 +239,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 13 && count == 1 && w >= 16 && h > 0) {
+-                std::fprintf(stderr, "F16A_1D ld=13 w=%d h=%d d32x16e16\n", w, h);
++                XE2MX4_DPRINTF( "F16A_1D ld=13 w=%d h=%d d32x16e16\n", w, h);
+                 std::fflush(stderr);
+                 GRF th = state.ra.alloc();
+                 auto spec32 = block_2d(D32, 16, 1, 1) | astrategy.cachingR;
+@@ -245,7 +255,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if ((ld1 == 14 || ld1 == 15 || ld1 == 16 || ld1 == 18 || ld1 == 19 || ld1 == 20) && count == 1 && w >= 16 && h > 0) {
+-                std::fprintf(stderr, "F16A_1D ld=%d w=%d h=%d scalarD32 ptr=%d\n", ld1, w, h, (int) state.f16aPtr.isValid());
++                XE2MX4_DPRINTF( "F16A_1D ld=%d w=%d h=%d scalarD32 ptr=%d\n", ld1, w, h, (int) state.f16aPtr.isValid());
+                 std::fflush(stderr);
+                 GRF th = state.ra.alloc();
+                 GRF tt = state.ra.alloc();
+@@ -291,7 +301,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 21 && count == 1 && w >= 16 && h > 0) {
+-                std::fprintf(stderr, "F16A_1D ld=21 w=%d h=%d d32_1x1\n", w, h);
++                XE2MX4_DPRINTF( "F16A_1D ld=21 w=%d h=%d d32_1x1\n", w, h);
+                 std::fflush(stderr);
+                 GRF th = state.ra.alloc();
+                 auto spec1 = block_2d(D32, 1, 1, 1) | astrategy.cachingR;
+@@ -310,7 +320,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if ((ld1 == 22 || ld1 == 23 || ld1 == 24) && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=%d w=%d h=%d d32t ptr=1\n", ld1, w, h);
++                XE2MX4_DPRINTF( "F16A_1D ld=%d w=%d h=%d d32t ptr=1\n", ld1, w, h);
+                 std::fflush(stderr);
+                 GRF th = state.ra.alloc();
+                 GRF tt = state.ra.alloc();
+@@ -336,7 +346,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 25 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=25 w=%d h=%d d32ugm ptr=1\n", w, h);
++                XE2MX4_DPRINTF( "F16A_1D ld=25 w=%d h=%d d32ugm ptr=1\n", w, h);
+                 std::fflush(stderr);
+                 GRF th = state.ra.alloc();
+                 GRF tt = state.ra.alloc();
+@@ -357,7 +367,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 26 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=26 w=%d h=%d scatterD32 ptr=1 dest=%d offR=%d offC=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=26 w=%d h=%d scatterD32 ptr=1 dest=%d offR=%d offC=%d\n",
+                         w, h, dest.getBase(), block.offsetR, block.offsetC);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -400,7 +410,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 27 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=27 w=%d h=%d scatterAddr scalarDest dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=27 w=%d h=%d scatterAddr scalarDest dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -443,7 +453,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 28 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=28 w=%d h=%d scatterD16U32 ptr=1 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=28 w=%d h=%d scatterD16U32 ptr=1 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -486,7 +496,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 29 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=29 w=%d h=%d scalarAddr D32(1) dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=29 w=%d h=%d scalarAddr D32(1) dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -529,7 +539,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 30 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=30 w=%d h=%d scalarAddr evenPack dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=30 w=%d h=%d scalarAddr evenPack dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -573,7 +583,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 31 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=31 w=%d h=%d D16U32 evenPack dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=31 w=%d h=%d D16U32 evenPack dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -617,7 +627,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 32 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=32 w=%d h=%d evenPack8 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=32 w=%d h=%d evenPack8 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -661,7 +671,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 33 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=33 w=%d h=%d scalarEvenPack dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=33 w=%d h=%d scalarEvenPack dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -706,7 +716,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 34 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=34 w=%d h=%d spliceHf2 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=34 w=%d h=%d spliceHf2 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -750,7 +760,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 35 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=35 w=%d h=%d scalarD16U32 even dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=35 w=%d h=%d scalarD16U32 even dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -784,7 +794,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 36 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=36 w=%d h=%d rangeAddr udDest dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=36 w=%d h=%d rangeAddr udDest dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -827,7 +837,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 37 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=37 w=%d h=%d seqD32 tmpd dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=37 w=%d h=%d seqD32 tmpd dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -862,7 +872,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 38 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=38 w=%d h=%d onlyK2intoUd0 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=38 w=%d h=%d onlyK2intoUd0 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -894,7 +904,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 39 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=39 w=%d h=%d seqD32 destUd dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=39 w=%d h=%d seqD32 destUd dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -926,7 +936,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 40 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=40 w=%d h=%d Kj_to_hf2j dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=40 w=%d h=%d Kj_to_hf2j dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -964,7 +974,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 41 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=41 w=%d h=%d slideEvenHf dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=41 w=%d h=%d slideEvenHf dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -1003,7 +1013,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 42 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=42 w=%d h=%d pack4grf dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=42 w=%d h=%d pack4grf dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -1044,7 +1054,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 43 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=43 w=%d h=%d dwdslide dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=43 w=%d h=%d dwdslide dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -1080,7 +1090,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 44 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=44 w=%d h=%d shl2dw dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=44 w=%d h=%d shl2dw dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -1118,7 +1128,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 45 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=45 w=%d h=%d indir dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=45 w=%d h=%d indir dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -1159,7 +1169,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 46 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=46 w=%d h=%d shl64 k1 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=46 w=%d h=%d shl64 k1 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -1197,7 +1207,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 48 && w >= 2 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=48 w=%d h=%d tmpshl dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=48 w=%d h=%d tmpshl dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -1237,7 +1247,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 49 && count == 1 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=49 w=%d h=%d igcud8 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=49 w=%d h=%d igcud8 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -1293,7 +1303,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 51 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=51 w=%d h=%d slmpack dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=51 w=%d h=%d slmpack dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -1341,7 +1351,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 52 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=52 w=%d h=%d simd2uq dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=52 w=%d h=%d simd2uq dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -1397,7 +1407,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 53 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=53 w=%d h=%d simd8ud1 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=53 w=%d h=%d simd8ud1 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -1430,7 +1440,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 54 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=54 w=%d h=%d indirb dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=54 w=%d h=%d indirb dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -1471,7 +1481,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 55 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=55 w=%d h=%d a0s1 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=55 w=%d h=%d a0s1 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int simd = 16;
+@@ -1516,7 +1526,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 56 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=56 w=%d h=%d simd1uq1 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=56 w=%d h=%d simd1uq1 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -1573,7 +1583,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 57 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=57 w=%d h=%d tmpuq1 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=57 w=%d h=%d tmpuq1 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -1629,7 +1639,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 58 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=58 w=%d h=%d a0s1x4 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=58 w=%d h=%d a0s1x4 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 const int n8 = 8;
+@@ -1674,7 +1684,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 59 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=59 w=%d h=%d d32t16e1 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=59 w=%d h=%d d32t16e1 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -1705,7 +1715,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 60 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=60 w=%d h=%d d32_16e1 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=60 w=%d h=%d d32_16e1 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -1736,7 +1746,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if ((ld1 == 61 || ld1 == 62 || ld1 == 63 || ld1 == 64 || ld1 == 65 || ld1 == 66) && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=%d w=%d h=%d pack2 dest=%d offR=%d plen=%d pbase=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=%d w=%d h=%d pack2 dest=%d offR=%d plen=%d pbase=%d\n",
+                         ld1, w, h, dest.getBase(), block.offsetR, state.f16aPack.getLen(),
+                         state.f16aPack.getLen() ? state.f16aPack[0].getBase() : -1);
+                 std::fflush(stderr);
+@@ -1821,7 +1831,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if ((ld1 == 68 || ld1 == 69) && w >= 2 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=%d w=%d h=%d pair8 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=%d w=%d h=%d pair8 dest=%d offR=%d\n",
+                         ld1, w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -1871,7 +1881,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 70 && w >= 2 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=70 w=%d h=%d d32x16 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=70 w=%d h=%d d32x16 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -1905,7 +1915,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 71 && count == 1 && w >= 16 && h > 0) {
+-                std::fprintf(stderr, "F16A_1D ld=71 w=%d h=%d d16_32x1e1 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=71 w=%d h=%d d16_32x1e1 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 GRF th = state.ra.alloc();
+@@ -1921,7 +1931,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if ((ld1 == 72 || ld1 == 73) && count == 1 && w >= 16 && h > 0) {
+-                std::fprintf(stderr, "F16A_1D ld=%d w=%d h=%d d16_32x1x2 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=%d w=%d h=%d d16_32x1x2 dest=%d offR=%d\n",
+                         ld1, w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 GRF th = state.ra.alloc();
+@@ -1942,7 +1952,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 74 && count == 1 && w >= 16 && h > 0) {
+-                std::fprintf(stderr, "F16A_1D ld=74 w=%d h=%d igchdr dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=74 w=%d h=%d igchdr dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 GRF th = state.ra.alloc();
+@@ -1961,7 +1971,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 75 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=75 w=%d h=%d d32x16t1 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=75 w=%d h=%d d32x16t1 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -1983,7 +1993,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 76 && w >= 16 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=76 w=%d h=%d d16x32t1 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=76 w=%d h=%d d16x32t1 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -2005,7 +2015,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 77 && count == 1 && w >= 16 && h > 0) {
+-                std::fprintf(stderr, "F16A_1D ld=77 w=%d h=%d d16_32x1hf dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=77 w=%d h=%d d16_32x1hf dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 GRF th = state.ra.alloc();
+@@ -2021,7 +2031,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if ((ld1 == 78 || ld1 == 79) && count == 1 && w >= 16 && h > 0) {
+-                std::fprintf(stderr, "F16A_1D ld=%d w=%d h=%d d16_32x1dt dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=%d w=%d h=%d d16_32x1dt dest=%d offR=%d\n",
+                         ld1, w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 GRF th = state.ra.alloc();
+@@ -2040,7 +2050,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 80 && count == 1 && w >= 16 && h > 0) {
+-                std::fprintf(stderr, "F16A_1D ld=80 w=%d h=%d d16_32x1s16 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=80 w=%d h=%d d16_32x1s16 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 GRF th = state.ra.alloc();
+@@ -2049,7 +2059,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                     MessageDescriptor dsc;
+                     ExtendedMessageDescriptor exd;
+                     encodeLoadDescriptors(hw, dsc, exd, InstructionModifier(1), dest, spec31, astrategy.base, addr[0]);
+-                    std::fprintf(stderr, "F16A_DESC ld=80 desc=0x%x ex=0x%x\n", dsc.all, exd.all);
++                    XE2MX4_DPRINTF( "F16A_DESC ld=80 desc=0x%x ex=0x%x\n", dsc.all, exd.all);
+                     std::fflush(stderr);
+                 }
+                 for (int r = 0; r < h; r++) {
+@@ -2063,7 +2073,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if ((ld1 == 81 || ld1 == 82) && count == 1 && w >= 16 && h > 0) {
+-                std::fprintf(stderr, "F16A_1D ld=%d w=%d h=%d d16_16x2pack dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=%d w=%d h=%d d16_16x2pack dest=%d offR=%d\n",
+                         ld1, w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 GRF th = state.ra.alloc();
+@@ -2075,7 +2085,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                     MessageDescriptor dsc;
+                     ExtendedMessageDescriptor exd;
+                     encodeLoadDescriptors(hw, dsc, exd, InstructionModifier(1), buf[0], spec2, astrategy.base, addr[0]);
+-                    std::fprintf(stderr, "F16A_DESC ld=%d desc=0x%x ex=0x%x\n", ld1, dsc.all, exd.all);
++                    XE2MX4_DPRINTF( "F16A_DESC ld=%d desc=0x%x ex=0x%x\n", ld1, dsc.all, exd.all);
+                     std::fflush(stderr);
+                 }
+                 for (int r = 0; r < h; r++) {
+@@ -2092,7 +2102,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if ((ld1 == 86 || ld1 == 87) && count == 1 && w >= 16 && h > 0) {
+-                std::fprintf(stderr, "F16A_1D ld=%d w=%d h=%d d16_32x1reg dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=%d w=%d h=%d d16_32x1reg dest=%d offR=%d\n",
+                         ld1, w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 GRF th = state.ra.alloc();
+@@ -2111,7 +2121,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 88 && w >= 2 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=88 w=%d h=%d pack8even dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=88 w=%d h=%d pack8even dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -2142,7 +2152,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 89 && w >= 2 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=89 w=%d h=%d d16pack4 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=89 w=%d h=%d d16pack4 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -2195,7 +2205,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 90 && w >= 2 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=90 w=%d h=%d uwpack dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=90 w=%d h=%d uwpack dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -2251,7 +2261,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 91 && w >= 2 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=91 w=%d h=%d hf1ins dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=91 w=%d h=%d hf1ins dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -2290,7 +2300,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 92 && w >= 2 && h > 0 && state.f16aPtr.isValid() && state.f16aPack.getLen() > 0) {
+-                std::fprintf(stderr, "F16A_1D ld=92 w=%d h=%d packcvt dest=%d plen=%d p0=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=92 w=%d h=%d packcvt dest=%d plen=%d p0=%d offR=%d\n",
+                         w, h, dest.getBase(), state.f16aPack.getLen(),
+                         state.f16aPack[0].getBase(), block.offsetR);
+                 std::fflush(stderr);
+@@ -2336,7 +2346,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 93 && w >= 2 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=93 w=%d h=%d l48ud2 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=93 w=%d h=%d l48ud2 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -2389,7 +2399,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 94 && w >= 2 && h > 0 && state.f16aPtr.isValid()) {
+-                std::fprintf(stderr, "F16A_1D ld=94 w=%d h=%d l48ud8 dest=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=94 w=%d h=%d l48ud8 dest=%d offR=%d\n",
+                         w, h, dest.getBase(), block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -2442,7 +2452,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 97 && w >= 2 && h > 0 && state.f16aPtr.isValid() && state.f16aPack.getLen() > 0) {
+-                std::fprintf(stderr, "F16A_1D ld=97 w=%d h=%d scatterpack dest=%d plen=%d p0=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=97 w=%d h=%d scatterpack dest=%d plen=%d p0=%d offR=%d\n",
+                         w, h, dest.getBase(), state.f16aPack.getLen(),
+                         state.f16aPack[0].getBase(), block.offsetR);
+                 std::fflush(stderr);
+@@ -2494,7 +2504,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 101 && w >= 2 && h > 0 && state.f16aPtr.isValid() && state.f16aPack.getLen() >= 4) {
+-                std::fprintf(stderr, "F16A_1D ld=101 w=%d h=%d offR=%d ptr4\n", w, h, block.offsetR);
++                XE2MX4_DPRINTF( "F16A_1D ld=101 w=%d h=%d offR=%d ptr4\n", w, h, block.offsetR);
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+                 auto trow = state.ra.alloc_sub<uint64_t>();
+@@ -2523,7 +2533,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 100 && w >= 2 && h > 0 && state.f16aPtr.isValid() && state.f16aPack.getLen() >= 4) {
+-                std::fprintf(stderr, "F16A_1D ld=100 w=%d h=%d offR=%d plen=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=100 w=%d h=%d offR=%d plen=%d\n",
+                         w, h, block.offsetR, state.f16aPack.getLen());
+                 std::fflush(stderr);
+                 auto th = state.ra.alloc();
+@@ -2539,7 +2549,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+             }
+             if (ld1 == 99 && w >= 2 && h > 0 && state.f16aPtr.isValid() && state.f16aPack.getLen() > 0) {
+                 state.f16aBump = true;
+-                std::fprintf(stderr, "F16A_1D ld=99 w=%d h=%d d32x16pack dest=%d plen=%d p0=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=99 w=%d h=%d d32x16pack dest=%d plen=%d p0=%d offR=%d\n",
+                         w, h, dest.getBase(), state.f16aPack.getLen(),
+                         state.f16aPack[0].getBase(), block.offsetR);
+                 std::fflush(stderr);
+@@ -2572,7 +2582,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if (ld1 == 98 && w >= 16 && h > 0 && state.f16aPack.getLen() > 0) {
+-                std::fprintf(stderr, "F16A_1D ld=98 w=%d h=%d b2dpack dest=%d plen=%d p0=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=98 w=%d h=%d b2dpack dest=%d plen=%d p0=%d offR=%d\n",
+                         w, h, dest.getBase(), state.f16aPack.getLen(),
+                         state.f16aPack[0].getBase(), block.offsetR);
+                 std::fflush(stderr);
+@@ -2595,7 +2605,7 @@ void Generator<hw>::loadMatrixBlock(const Register &dest, const RegisterBlock &b
+                 break;
+             }
+             if ((ld1 == 96) && w >= 2 && h > 0 && state.f16aPtr.isValid() && state.f16aPack.getLen() > 0) {
+-                std::fprintf(stderr, "F16A_1D ld=%d w=%d h=%d l48shuf dest=%d plen=%d p0=%d offR=%d\n",
++                XE2MX4_DPRINTF( "F16A_1D ld=%d w=%d h=%d l48shuf dest=%d plen=%d p0=%d offR=%d\n",
+                         ld1, w, h, dest.getBase(), state.f16aPack.getLen(),
+                         state.f16aPack[0].getBase(), block.offsetR);
+                 std::fflush(stderr);
+diff --git a/src/gpu/intel/gemm/jit/generator/pieces/quantization.cxx b/src/gpu/intel/gemm/jit/generator/pieces/quantization.cxx
+index 77a93b7..f9aabcf 100644
+--- a/src/gpu/intel/gemm/jit/generator/pieces/quantization.cxx
++++ b/src/gpu/intel/gemm/jit/generator/pieces/quantization.cxx
+@@ -25,6 +25,16 @@
+ #include <cstdio>
+ #include <cstdlib>
+ 
++#ifndef XE2MX4_DPRINTF
++#include <cstdio>
++#include <cstdlib>
++#define XE2MX4_DPRINTF(...) \
++    do { \
++        static const bool xe2mx4_dbg_on_ = std::getenv("ONEDNN_XE2MX4_DEBUG") != nullptr; \
++        if (xe2mx4_dbg_on_) std::fprintf(stderr, __VA_ARGS__); \
++    } while (0)
++#endif
++
+ GEMMSTONE_NAMESPACE_START
+ 
+ using namespace ngen;
+@@ -213,7 +223,7 @@ bool Generator<hw>::gemmMake2DQuantizationLayouts(bool isA, const GEMMProblem &p
+         static int nls = 0;
+         if (nls < 4) {
+             nls++;
+-            std::fprintf(stderr, "slmB q B late=%d Txs_int=%d slay=%d rlay=%d rs=%d cs=%d\n",
++            XE2MX4_DPRINTF( "slmB q B late=%d Txs_int=%d slay=%d rlay=%d rs=%d cs=%d\n",
+                     (int)lateScale, (int)Txs_int, X_scaleLayout.regs(), Xr_scaleLayout.regs(), rs, cs);
+             std::fflush(stderr);
+         }
+@@ -404,7 +414,7 @@ void Generator<hw>::gemmDequantizeOperation(bool doA, Type T, Type Tq, BinaryOp
+                 static int ndv = 0;
+                 if (op == BinaryOp::Div && ndv < 8) {
+                     ndv++;
+-                    std::fprintf(stderr, "div simd=%d ne=%d strided=%d cp=%d off=%d base=%d x0=%d y0=%d\n",
++                    XE2MX4_DPRINTF( "div simd=%d ne=%d strided=%d cp=%d off=%d base=%d x0=%d y0=%d\n",
+                             simd, ne, strided, crosspack, data.getOffset(), data.getBase(), x0, y0);
+                     std::fflush(stderr);
+                 }
+@@ -736,7 +746,7 @@ void Generator<hw>::gemmDequantizeAB(bool doA, const RegisterLayout &layoutSrc,
+                 static int nsh = 0;
+                 if (nsh < 1) {
+                     nsh++;
+-                    std::fprintf(stderr, "F16A_SHUF=%d\n", shuf);
++                    XE2MX4_DPRINTF( "F16A_SHUF=%d\n", shuf);
+                     std::fflush(stderr);
+                 }
+                 GRF twc = state.ra.try_alloc();
+@@ -928,7 +938,7 @@ void Generator<hw>::gemmDequantizeAB(bool doA, const RegisterLayout &layoutSrc,
+                     }
+                 }
+                 const int nblk = (state.f16aPack.getLen() >= 2) ? 2 : 1;
+-                std::fprintf(stderr, "F16A_M23 src0=%d cols=%d dstlen=%d nblk=%d plen=%d bqgN=%d\n",
++                XE2MX4_DPRINTF( "F16A_M23 src0=%d cols=%d dstlen=%d nblk=%d plen=%d bqgN=%d\n",
+                         src[0].getBase(), layoutSrc.cols(), dst0.getLen(), nblk,
+                         state.f16aPack.getLen(), problem.bqGroupN);
+                 std::fflush(stderr);
+@@ -938,7 +948,7 @@ void Generator<hw>::gemmDequantizeAB(bool doA, const RegisterLayout &layoutSrc,
+                         ndb++;
+                         for (int b = 0; b < layoutDst0.blocks() && b < 8; b++) {
+                             const auto &bk = layoutDst0[b];
+-                            std::fprintf(stderr, "F16A_DSTB b=%d nr=%d nc=%d oR=%d oC=%d cm=%d cp=%d ob=%d bytes=%d ld=%d\n",
++                            XE2MX4_DPRINTF( "F16A_DSTB b=%d nr=%d nc=%d oR=%d oC=%d cm=%d cp=%d ob=%d bytes=%d ld=%d\n",
+                                     b, bk.nr, bk.nc, bk.offsetR, bk.offsetC, (int) bk.colMajor,
+                                     bk.crosspack, bk.offsetBytes, bk.bytes, bk.ld);
+                             std::fflush(stderr);
+@@ -1289,7 +1299,7 @@ void Generator<hw>::gemmDequantizeAB(bool doA, const RegisterLayout &layoutSrc,
+                             GRF dg = dst0[m / 2];
+                             const int byte = (m % 2) * 32 + (k0 / 2);
+                             if (pi == 0 && blk == 0) {
+-                                std::fprintf(stderr, "F16A_FIND m=%d k0=%d ne=%d findb=%d findo=%d gi=%d byte=%d dst0=%d\n",
++                                XE2MX4_DPRINTF( "F16A_FIND m=%d k0=%d ne=%d findb=%d findo=%d gi=%d byte=%d dst0=%d\n",
+                                         m, k0, ne,
+                                         d2.isValid() ? d2.getBase() : -1,
+                                         d2.isValid() ? (int) d2.getOffset() : -1,
+@@ -1318,7 +1328,7 @@ void Generator<hw>::gemmDequantizeAB(bool doA, const RegisterLayout &layoutSrc,
+                             or_(1, ds.ud(0), ds.ud(0), sav.ud(0));
+                             mov(1, dg.uw(wi), ds.uw(0));
+                             if (m == 0 && ((blk == 0 && (pi == 0 || pi == 7)) || (blk == 1 && pi == 0))) {
+-                                std::fprintf(stderr, "F16A_NIB cm=%d sr=%d sc=%d dstlen=%d pass=%d h=%d kab=%d kq=%d k0=%d ne=%d d2b=%d d2o=%d byte=%d pi=%d blk=%d m=%d\n",
++                                XE2MX4_DPRINTF( "F16A_NIB cm=%d sr=%d sc=%d dstlen=%d pass=%d h=%d kab=%d kq=%d k0=%d ne=%d d2b=%d d2o=%d byte=%d pi=%d blk=%d m=%d\n",
+                                         (int) layoutSrc.colMajor(), layoutSrc.rows(), layoutSrc.cols(),
+                                         dst0.getLen(), pass, h, kab_load, kq_load, k0, ne,
+                                         d2.getBase(), (int) d2.getOffset(), byte, pi, blk, m);
+diff --git a/src/gpu/intel/gemm/jit/generator/pieces/register_allocation.cxx b/src/gpu/intel/gemm/jit/generator/pieces/register_allocation.cxx
+index 26bdfcc..0b25fc9 100644
+--- a/src/gpu/intel/gemm/jit/generator/pieces/register_allocation.cxx
++++ b/src/gpu/intel/gemm/jit/generator/pieces/register_allocation.cxx
+@@ -21,6 +21,16 @@
+ #include "layout_utils.hpp"
+ #include <cstdio>
+ 
++#ifndef XE2MX4_DPRINTF
++#include <cstdio>
++#include <cstdlib>
++#define XE2MX4_DPRINTF(...) \
++    do { \
++        static const bool xe2mx4_dbg_on_ = std::getenv("ONEDNN_XE2MX4_DEBUG") != nullptr; \
++        if (xe2mx4_dbg_on_) std::fprintf(stderr, __VA_ARGS__); \
++    } while (0)
++#endif
++
+ GEMMSTONE_NAMESPACE_START
+ 
+ using namespace ngen;
+@@ -607,7 +617,7 @@ void Generator<hw>::gemmAllocAoBoRegs(const GEMMStrategy &strategy, GEMMState &s
+         static int nalloc = 0;
+         if (nalloc < 4 && strategy.slmB) {
+             nalloc++;
+-            std::fprintf(stderr, "slmB alloc Bo n=%d alloc=%d reuse=%d len=%d Blen=%d\n",
++            XE2MX4_DPRINTF( "slmB alloc Bo n=%d alloc=%d reuse=%d len=%d Blen=%d\n",
+                     Bo_nregs, (int)allocBo, (int)state.boReuseB,
+                     state.Bo_regs.getLen(),
+                     state.B_regs.empty() ? -1 : state.B_regs[0].getLen());
+-- 
+2.47.3
+

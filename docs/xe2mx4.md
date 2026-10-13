@@ -15,12 +15,12 @@ cmake --build build-sycl --target llama-server llama-quantize llama-perplexity
 
 ## oneDNN
 
-The fast path needs oneDNN v3.11.4 with the two patches in `docs/xe2mx4-onednn/`.
+The fast path needs oneDNN v3.11.4 with the patches in `docs/xe2mx4-onednn/`.
 The stock oneDNN that ships with oneAPI works, but XE2MX4 prefill then uses
 the stock s4 matmul and is about 4x slower. Keep the default `-ub 512` on stock
 oneDNN; `-ub 3072` is slower there, not faster.
 
-26k prompt, B65, same GGUF:
+26k prompt, tested on Arc Pro B65 (Xe2 dGPU), same GGUF:
 
 ```
 oneDNN    -ub    PP     TG
