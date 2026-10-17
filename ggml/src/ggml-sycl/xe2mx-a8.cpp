@@ -3315,6 +3315,797 @@ static bool launch_s4t_nt(queue_ptr stream, const uint8_t * pg, const float * sc
     return true;
 }
 
+template <int NT>
+static bool launch_moe_id_nt(queue_ptr stream, const uint8_t * wp_soa, const int64_t * ep, const int8_t * A, const float * da,
+                             float * yp, int K, int N, int rows, int batch) {
+    constexpr int RC  = XE2MX_PF_RC;
+    constexpr int LGS = XE2MX_PF_LGS;
+    const int nb = K / 32;
+    if ((nb & 1) != 0) {
+        return false;
+    }
+    const int nstep = 16 * NT;
+    if ((N % nstep) != 0) {
+        return false;
+    }
+    const int m_span = RC * LGS;
+    const int m_groups = (rows + m_span - 1) / m_span;
+    const int n_tiles = N / nstep;
+    const unsigned pitch = (unsigned) nb * 16u;
+    const size_t expert_w_stride = (size_t) N * (size_t) pitch + (size_t) nb * (size_t) N * sizeof(uint16_t);
+    const unsigned sw = pitch - 1u;
+    const unsigned sh = (unsigned) N - 1u;
+    const unsigned aw = (unsigned) K - 1u;
+    const unsigned ah = (unsigned) rows - 1u;
+    const auto props = sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> };
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>((size_t) batch, (size_t) m_groups * (size_t) LGS, (size_t) n_tiles),
+                          sycl::range<3>(1, (size_t) LGS, 1)),
+        props,
+        [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
+            const int b  = (int) it.get_global_id(0);
+            const int m0 = (int) it.get_global_id(1) * RC;
+            const int n0 = (int) it.get_global_id(2) * nstep;
+            if (m0 >= rows) {
+                return;
+            }
+            const int64_t e_idx = ep ? ep[b] : (int64_t) b;
+            const uint8_t * we_base = wp_soa + (size_t) e_idx * expert_w_stride;
+            const uint32_t * qs32 = (const uint32_t *) we_base;
+            const uint16_t * d16  = (const uint16_t *) (we_base + (size_t) N * (size_t) pitch);
+            const int8_t * A_b  = A + (size_t) b * (size_t) rows * (size_t) K;
+            const float *  da_b = da + (size_t) b * (size_t) rows * (size_t) nb;
+            float *        C_b  = yp + (size_t) b * (size_t) rows * (size_t) N;
+
+            simd<float, RC * 16> acc[NT];
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                acc[t] = 0.0f;
+            }
+            for (int ib = 0; ib < nb; ib += 2) {
+                if (ib + 2 < nb) {
+                    ex::lsc_prefetch_2d<int8_t, 32, RC, 1, cache_hint::cached, cache_hint::cached>(
+                        A_b, aw, ah, aw, (ib + 2) * 32, m0);
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        ex::lsc_prefetch_2d<uint32_t, 8, 16, 1, cache_hint::cached, cache_hint::cached>(
+                            qs32, sw, sh, sw, (ib + 2) * 4, n0 + t * 16);
+                    }
+                }
+                simd<uint32_t, 128> T[NT];
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    T[t] = ex::lsc_load_2d<uint32_t, 8, 16, 1, true, false>(
+                        qs32, sw, sh, sw, ib * 4, n0 + t * 16);
+                }
+#pragma unroll
+                for (int s = 0; s < 2; ++s) {
+                    simd<int8_t, RC * 32> Am =
+                        ex::lsc_load_2d<int8_t, 32, RC, 1, false, false>(A_b, aw, ah, aw, (ib + s) * 32, m0);
+                    float dar[RC];
+#pragma unroll
+                    for (int r = 0; r < RC; ++r) {
+                        const int m = m0 + r;
+                        dar[r] = 0.0f;
+                        if (m < rows) {
+                            dar[r] = da_b[(size_t) m * (size_t) nb + (size_t) (ib + s)];
+                        }
+                    }
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        const int nt = n0 + t * 16;
+                        simd<uint32_t, 64> B4 = T[t].template select<64, 1>(64 * s);
+                        B4 = B4 ^ simd<uint32_t, 64>(0x88888888u);
+                        simd<uint8_t, 256> Bw = B4.template bit_cast_view<uint8_t>();
+                        simd<int, RC * 16> Ci =
+                            xmx::dpas<8, RC, int, int, uint8_t, int8_t, xmx::dpas_argument_type::s4, xmx::dpas_argument_type::s8>(
+                                simd<int, RC * 16>(0), Bw, Am);
+                        simd<uint16_t, 16> db = block_load<uint16_t, 16>(
+                            d16 + (size_t) (ib + s) * (size_t) N + (size_t) nt);
+                        simd<sycl::half, 16> dh = db.template bit_cast_view<sycl::half>();
+                        simd<float, 16> dw = convert<float>(dh);
+#pragma unroll
+                        for (int r = 0; r < RC; ++r) {
+                            simd<int, 16> ci = Ci.template select<16, 1>(r * 16);
+                            acc[t].template select<16, 1>(r * 16) += convert<float>(ci) * dw * dar[r];
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < RC; ++r) {
+                const int m = m0 + r;
+                if (m < rows) {
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        simd<float, 16> row = acc[t].template select<16, 1>(r * 16);
+                        row.copy_to(C_b + (size_t) m * (size_t) N + (size_t) (n0 + t * 16));
+                    }
+                }
+            }
+        });
+    return true;
+}
+
+
+template <int NT>
+static bool launch_moe_tiles_nt(queue_ptr stream, const uint8_t * wp_soa, const int32_t * tiles, const int32_t * n_tiles_dev,
+                                const int8_t * A, const float * da, float * yp, int K, int N, int max_tiles) {
+    constexpr int RC  = XE2MX_PF_RC;
+    constexpr int LGS = XE2MX_PF_LGS;
+    const int nb = K / 32;
+    if ((nb & 1) != 0) {
+        return false;
+    }
+    const int nstep = 16 * NT;
+    if ((N % nstep) != 0) {
+        return false;
+    }
+    const int n_tiles = N / nstep;
+    const unsigned pitch = (unsigned) nb * 16u;
+    const size_t expert_w_stride = (size_t) N * (size_t) pitch + (size_t) nb * (size_t) N * sizeof(uint16_t);
+    const unsigned sw = pitch - 1u;
+    const unsigned sh = (unsigned) N - 1u;
+    const unsigned aw = (unsigned) K - 1u;
+    const auto props = sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> };
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>((size_t) max_tiles, (size_t) LGS, (size_t) n_tiles),
+                          sycl::range<3>(1, (size_t) LGS, 1)),
+        props,
+        [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
+            const int ti = (int) it.get_global_id(0);
+            if (ti >= *n_tiles_dev) {
+                return;
+            }
+            // tile: expert, expert row_start, expert padded rows, tile m base
+            const int64_t e_idx = tiles[4 * ti + 0];
+            const int row_start = tiles[4 * ti + 1];
+            const int rows      = tiles[4 * ti + 2];
+            const int m0 = tiles[4 * ti + 3] + (int) it.get_local_id(1) * RC;
+            const int n0 = (int) it.get_global_id(2) * nstep;
+            if (m0 >= rows) {
+                return;
+            }
+            const unsigned ah = (unsigned) rows - 1u;
+            const uint8_t * we_base = wp_soa + (size_t) e_idx * expert_w_stride;
+            const uint32_t * qs32 = (const uint32_t *) we_base;
+            const uint16_t * d16  = (const uint16_t *) (we_base + (size_t) N * (size_t) pitch);
+            const int8_t * A_b  = A + (size_t) row_start * (size_t) K;
+            const float *  da_b = da + (size_t) row_start * (size_t) nb;
+            float *        C_b  = yp + (size_t) row_start * (size_t) N;
+
+            simd<float, RC * 16> acc[NT];
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                acc[t] = 0.0f;
+            }
+            for (int ib = 0; ib < nb; ib += 2) {
+                if (ib + 2 < nb) {
+                    ex::lsc_prefetch_2d<int8_t, 32, RC, 1, cache_hint::cached, cache_hint::cached>(
+                        A_b, aw, ah, aw, (ib + 2) * 32, m0);
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        ex::lsc_prefetch_2d<uint32_t, 8, 16, 1, cache_hint::cached, cache_hint::cached>(
+                            qs32, sw, sh, sw, (ib + 2) * 4, n0 + t * 16);
+                    }
+                }
+                simd<uint32_t, 128> T[NT];
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    T[t] = ex::lsc_load_2d<uint32_t, 8, 16, 1, true, false>(
+                        qs32, sw, sh, sw, ib * 4, n0 + t * 16);
+                }
+#pragma unroll
+                for (int s = 0; s < 2; ++s) {
+                    simd<int8_t, RC * 32> Am =
+                        ex::lsc_load_2d<int8_t, 32, RC, 1, false, false>(A_b, aw, ah, aw, (ib + s) * 32, m0);
+                    float dar[RC];
+#pragma unroll
+                    for (int r = 0; r < RC; ++r) {
+                        const int m = m0 + r;
+                        dar[r] = 0.0f;
+                        if (m < rows) {
+                            dar[r] = da_b[(size_t) m * (size_t) nb + (size_t) (ib + s)];
+                        }
+                    }
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        const int nt = n0 + t * 16;
+                        simd<uint32_t, 64> B4 = T[t].template select<64, 1>(64 * s);
+                        B4 = B4 ^ simd<uint32_t, 64>(0x88888888u);
+                        simd<uint8_t, 256> Bw = B4.template bit_cast_view<uint8_t>();
+                        simd<int, RC * 16> Ci =
+                            xmx::dpas<8, RC, int, int, uint8_t, int8_t, xmx::dpas_argument_type::s4, xmx::dpas_argument_type::s8>(
+                                simd<int, RC * 16>(0), Bw, Am);
+                        simd<uint16_t, 16> db = block_load<uint16_t, 16>(
+                            d16 + (size_t) (ib + s) * (size_t) N + (size_t) nt);
+                        simd<sycl::half, 16> dh = db.template bit_cast_view<sycl::half>();
+                        simd<float, 16> dw = convert<float>(dh);
+#pragma unroll
+                        for (int r = 0; r < RC; ++r) {
+                            simd<int, 16> ci = Ci.template select<16, 1>(r * 16);
+                            acc[t].template select<16, 1>(r * 16) += convert<float>(ci) * dw * dar[r];
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < RC; ++r) {
+                const int m = m0 + r;
+                if (m < rows) {
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        simd<float, 16> row = acc[t].template select<16, 1>(r * 16);
+                        row.copy_to(C_b + (size_t) m * (size_t) N + (size_t) (n0 + t * 16));
+                    }
+                }
+            }
+        });
+    return true;
+}
+
+
+
+template <int NT, int MB>
+static bool launch_moe_tiles_mb(queue_ptr stream, const uint8_t * wp_soa, const int32_t * tiles, const int32_t * n_tiles_dev,
+                                const int8_t * A, const float * da, float * yp, int K, int N, int max_tiles,
+                                const int32_t * ri1 = nullptr, const int32_t * ri2 = nullptr, char * yout = nullptr,
+                                size_t y1 = 0, size_t y2 = 0) {
+    constexpr int RC  = XE2MX_PF_RC;
+    constexpr int LGS = XE2MX_PF_LGS / MB;   // span stays RC*16 = 128 rows
+    const int nb = K / 32;
+    if ((nb & 1) != 0) {
+        return false;
+    }
+    const int nstep = 16 * NT;
+    if ((N % nstep) != 0) {
+        return false;
+    }
+    const int n_tiles = N / nstep;
+    const unsigned pitch = (unsigned) nb * 16u;
+    const size_t expert_w_stride = (size_t) N * (size_t) pitch + (size_t) nb * (size_t) N * sizeof(uint16_t);
+    const unsigned sw = pitch - 1u;
+    const unsigned sh = (unsigned) N - 1u;
+    const unsigned aw = (unsigned) K - 1u;
+    const auto props = sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> };
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>((size_t) max_tiles, (size_t) LGS, (size_t) n_tiles),
+                          sycl::range<3>(1, (size_t) LGS, 1)),
+        props,
+        [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
+            const int ti = (int) it.get_global_id(0);
+            if (ti >= *n_tiles_dev) {
+                return;
+            }
+            // tile: expert, expert row_start, expert padded rows, tile m base
+            const int64_t e_idx = tiles[4 * ti + 0];
+            const int row_start = tiles[4 * ti + 1];
+            const int rows      = tiles[4 * ti + 2];
+            const int m0 = tiles[4 * ti + 3] + (int) it.get_local_id(1) * RC * MB;
+            const int n0 = (int) it.get_global_id(2) * nstep;
+            if (m0 >= rows) {
+                return;
+            }
+            const unsigned ah = (unsigned) rows - 1u;
+            const uint8_t * we_base = wp_soa + (size_t) e_idx * expert_w_stride;
+            const uint32_t * qs32 = (const uint32_t *) we_base;
+            const uint16_t * d16  = (const uint16_t *) (we_base + (size_t) N * (size_t) pitch);
+            const int8_t * A_b  = A + (size_t) row_start * (size_t) K;
+            const float *  da_b = da + (size_t) row_start * (size_t) nb;
+            float *        C_b  = yp + (size_t) row_start * (size_t) N;
+
+            simd<float, RC * 16> acc[MB][NT];
+#pragma unroll
+            for (int mb = 0; mb < MB; ++mb)
+#pragma unroll
+                for (int t = 0; t < NT; ++t) acc[mb][t] = 0.0f;
+            for (int ib = 0; ib < nb; ib += 2) {
+                if (ib + 2 < nb) {
+#pragma unroll
+                    for (int mb = 0; mb < MB; ++mb) {
+                        ex::lsc_prefetch_2d<int8_t, 32, RC, 1, cache_hint::cached, cache_hint::cached>(
+                            A_b, aw, ah, aw, (ib + 2) * 32, m0 + mb * RC);
+                    }
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        ex::lsc_prefetch_2d<uint32_t, 8, 16, 1, cache_hint::cached, cache_hint::cached>(
+                            qs32, sw, sh, sw, (ib + 2) * 4, n0 + t * 16);
+                    }
+                }
+                simd<uint32_t, 128> T[NT];
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    T[t] = ex::lsc_load_2d<uint32_t, 8, 16, 1, true, false>(
+                        qs32, sw, sh, sw, ib * 4, n0 + t * 16);
+                }
+#pragma unroll
+                for (int s = 0; s < 2; ++s) {
+                    simd<float, 16> dw[NT];
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        simd<uint16_t, 16> db = block_load<uint16_t, 16>(
+                            d16 + (size_t) (ib + s) * (size_t) N + (size_t) (n0 + t * 16));
+                        dw[t] = convert<float>(db.template bit_cast_view<sycl::half>().read());
+                    }
+#pragma unroll
+                    for (int mb = 0; mb < MB; ++mb) {
+                        const int mr = m0 + mb * RC;
+                        if (mr >= rows) {
+                            continue;
+                        }
+                        simd<int8_t, RC * 32> Am =
+                            ex::lsc_load_2d<int8_t, 32, RC, 1, false, false>(A_b, aw, ah, aw, (ib + s) * 32, mr);
+                        float dar[RC];
+#pragma unroll
+                        for (int r = 0; r < RC; ++r) {
+                            dar[r] = (mr + r) < rows ? da_b[(size_t) (mr + r) * (size_t) nb + (size_t) (ib + s)] : 0.0f;
+                        }
+#pragma unroll
+                        for (int t = 0; t < NT; ++t) {
+                            simd<uint32_t, 64> B4 = T[t].template select<64, 1>(64 * s);
+                            B4 = B4 ^ simd<uint32_t, 64>(0x88888888u);
+                            simd<uint8_t, 256> Bw = B4.template bit_cast_view<uint8_t>();
+                            simd<int, RC * 16> Ci =
+                                xmx::dpas<8, RC, int, int, uint8_t, int8_t, xmx::dpas_argument_type::s4, xmx::dpas_argument_type::s8>(
+                                    simd<int, RC * 16>(0), Bw, Am);
+#pragma unroll
+                            for (int r = 0; r < RC; ++r) {
+                                simd<float, 16> sc = dw[t] * dar[r];
+                                acc[mb][t].template select<16, 1>(r * 16) =
+                                    convert<float>(Ci.template select<16, 1>(r * 16).read()) * sc +
+                                    acc[mb][t].template select<16, 1>(r * 16).read();
+                            }
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int mb = 0; mb < MB; ++mb)
+#pragma unroll
+            for (int r = 0; r < RC; ++r) {
+                const int m = m0 + mb * RC + r;
+                if (m < rows) {
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        simd<float, 16> row = acc[mb][t].template select<16, 1>(r * 16);
+                        if (yout) {
+                            // fused scatter: write straight to dst[token, slot]
+                            const int gr = row_start + m;
+                            const int32_t i1 = ri1[gr];
+                            if (i1 >= 0) {
+                                row.copy_to((float *) (yout + (size_t) i1 * y1 + (size_t) ri2[gr] * y2) + (n0 + t * 16));
+                            }
+                        } else {
+                            row.copy_to(C_b + (size_t) m * (size_t) N + (size_t) (n0 + t * 16));
+                        }
+                    }
+                }
+            }
+        });
+    return true;
+}
+
+
+
+
+// IQ2_XXS experts read in place (AoS block_iq2_xxs rows, 66 B per 256 weights).
+// Each 32-wide K step decodes 16 output columns to s8 (grid 8/25/43 with signs)
+// straight into the VNNI B operand, then one s8 x s8 DPAS. Scale per (row, 32).
+template <int NT, int MB>
+static bool launch_iq2_moe_id_nt(queue_ptr stream, const uint8_t * w, const int64_t * ep, size_t we, size_t wr,
+                                 const uint32_t * grid32, const int8_t * A, const float * da, float * yp,
+                                 int K, int N, int rows, int batch) {
+    constexpr int RC  = XE2MX_PF_RC;
+    constexpr int LGS = 4;
+    const int nb = K / 32;
+    const int nstep = 16 * NT;
+    if ((K % 256) != 0 || (N % nstep) != 0) {
+        return false;
+    }
+    const int m_span = RC * MB * LGS;
+    const int m_groups = (rows + m_span - 1) / m_span;
+    const int n_tiles = N / nstep;
+    const unsigned aw = (unsigned) K - 1u;
+    const unsigned ah = (unsigned) rows - 1u;
+    const auto props = sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> };
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>((size_t) batch, (size_t) m_groups * (size_t) LGS, (size_t) n_tiles),
+                          sycl::range<3>(1, (size_t) LGS, 1)),
+        props,
+        [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
+            const int b  = (int) it.get_global_id(0);
+            const int m0 = (int) it.get_global_id(1) * RC * MB;
+            const int n0 = (int) it.get_global_id(2) * nstep;
+            if (m0 >= rows) {
+                return;
+            }
+            const uint8_t * wb = w + (size_t) ep[b] * we;
+            const uint16_t * w16 = (const uint16_t *) wb;
+            const int8_t * A_b  = A + (size_t) b * (size_t) rows * (size_t) K;
+            const float *  da_b = da + (size_t) b * (size_t) rows * (size_t) nb;
+            float *        C_b  = yp + (size_t) b * (size_t) rows * (size_t) N;
+
+            simd<uint32_t, 16> lane(0, 1);
+            simd<float, RC * 16> acc[MB][NT];
+#pragma unroll
+            for (int mb = 0; mb < MB; ++mb)
+#pragma unroll
+                for (int t = 0; t < NT; ++t) acc[mb][t] = 0.0f;
+            simd<uint32_t, 16> e0[NT];
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                e0[t] = ((lane + (uint32_t) (n0 + t * 16)) * (uint32_t) wr) / 2u;
+            }
+            for (int ib = 0; ib < nb; ++ib) {
+                const uint32_t sbo = (uint32_t) ((ib >> 3) * 33);
+                const uint32_t i8o = (uint32_t) ((ib & 7) * 4);
+                simd<uint32_t, 128> Bd[NT];
+                simd<float, 16> dl[NT];
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    simd<uint32_t, 16> e = e0[t] + sbo;
+                    simd<uint16_t, 16> dq = gather<uint16_t, 16>(w16, e * 2u);
+                    simd<uint32_t, 16> q0 = gather<uint16_t, 16>(w16, (e + 1u + i8o) * 2u);
+                    simd<uint32_t, 16> q1 = gather<uint16_t, 16>(w16, (e + 2u + i8o) * 2u);
+                    simd<uint32_t, 16> q2 = gather<uint16_t, 16>(w16, (e + 3u + i8o) * 2u);
+                    simd<uint32_t, 16> q3 = gather<uint16_t, 16>(w16, (e + 4u + i8o) * 2u);
+                    simd<uint32_t, 16> aux32 = q2 | (q3 << 16);
+#pragma unroll
+                    for (int il = 0; il < 4; ++il) {
+                        simd<uint32_t, 16> idx = (il < 2 ? q0 : q1);
+                        idx = (il & 1) ? (idx >> 8) : (idx & 255u);
+                        simd<uint32_t, 16> lo = gather<uint32_t, 16>(grid32, idx * 8u);
+                        simd<uint32_t, 16> hi = gather<uint32_t, 16>(grid32, idx * 8u + 4u);
+                        simd<uint32_t, 16> s7 = (aux32 >> (7 * il)) & 127u;
+                        simd<uint32_t, 16> sg = s7 | ((cbit(s7) & 1u) << 7);
+                        simd<uint32_t, 16> mlo = (((sg & 15u) * 0x00204081u) & 0x01010101u) * 255u;
+                        simd<uint32_t, 16> mhi = ((((sg >> 4) & 15u) * 0x00204081u) & 0x01010101u) * 255u;
+                        Bd[t].template select<16, 1>((il * 2) * 16) = (lo ^ mlo) + (mlo & 0x01010101u);
+                        Bd[t].template select<16, 1>((il * 2 + 1) * 16) = (hi ^ mhi) + (mhi & 0x01010101u);
+                    }
+                    simd<sycl::half, 16> dh = dq.template bit_cast_view<sycl::half>();
+                    dl[t] = convert<float>(dh) * ((convert<float>(simd<uint32_t, 16>(aux32 >> 28)) + 0.5f) * 0.25f);
+                }
+#pragma unroll
+                for (int mb = 0; mb < MB; ++mb) {
+                    const int mr = m0 + mb * RC;
+                    if (mr >= rows) {
+                        break;
+                    }
+                    simd<int8_t, RC * 32> Am =
+                        ex::lsc_load_2d<int8_t, 32, RC, 1, false, false>(A_b, aw, ah, aw, ib * 32, mr);
+                    float dar[RC];
+#pragma unroll
+                    for (int r = 0; r < RC; ++r) {
+                        dar[r] = (mr + r) < rows ? da_b[(size_t) (mr + r) * (size_t) nb + (size_t) ib] : 0.0f;
+                    }
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        simd<uint8_t, 512> Bw = Bd[t].template bit_cast_view<uint8_t>();
+                        simd<int, RC * 16> Ci =
+                            xmx::dpas<8, RC, int, int, uint8_t, int8_t, xmx::dpas_argument_type::s8, xmx::dpas_argument_type::s8>(
+                                simd<int, RC * 16>(0), Bw, Am);
+#pragma unroll
+                        for (int r = 0; r < RC; ++r) {
+                            simd<int, 16> ci = Ci.template select<16, 1>(r * 16);
+                            acc[mb][t].template select<16, 1>(r * 16) += convert<float>(ci) * (dl[t] * dar[r]);
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int mb = 0; mb < MB; ++mb) {
+#pragma unroll
+                for (int r = 0; r < RC; ++r) {
+                    const int m = m0 + mb * RC + r;
+                    if (m < rows) {
+#pragma unroll
+                        for (int t = 0; t < NT; ++t) {
+                            simd<float, 16> row = acc[mb][t].template select<16, 1>(r * 16);
+                            row.copy_to(C_b + (size_t) m * (size_t) N + (size_t) (n0 + t * 16));
+                        }
+                    }
+                }
+            }
+        });
+    return true;
+}
+
+
+// v3: the work-group decodes each 8x32 K chunk of its NT column tiles once into SLM,
+// then every thread runs its MB row blocks against that shared s8 operand.
+template <int NT, int MB, int LG>
+static bool launch_iq2_moe_slm(queue_ptr stream, const uint8_t * w, const int64_t * ep, size_t we, size_t wr,
+                               const uint32_t * grid32, const int8_t * A, const float * da, float * yp,
+                               int K, int N, int rows, int batch) {
+    constexpr int RC = XE2MX_PF_RC;
+    constexpr int CH = 8;
+    constexpr int TB = 512 + 64;
+    const int nb = K / 32;
+    const int nstep = 16 * NT;
+    if ((K % 256) != 0 || (N % nstep) != 0) {
+        return false;
+    }
+    const int m_span = RC * MB * LG;
+    const int m_groups = (rows + m_span - 1) / m_span;
+    const int n_tiles = N / nstep;
+    const unsigned aw = (unsigned) K - 1u;
+    const unsigned ah = (unsigned) rows - 1u;
+    const auto props = sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> };
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>((size_t) batch, (size_t) m_groups * (size_t) LG, (size_t) n_tiles),
+                          sycl::range<3>(1, (size_t) LG, 1)),
+        props,
+        [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
+            slm_init<CH * NT * TB>();
+            const int b  = (int) it.get_global_id(0);
+            const int li = (int) it.get_local_id(1);
+            const int m0 = (int) it.get_global_id(1) * RC * MB;
+            const int n0 = (int) it.get_global_id(2) * nstep;
+            const uint16_t * w16 = (const uint16_t *) (w + (size_t) ep[b] * we);
+            const int8_t * A_b  = A + (size_t) b * (size_t) rows * (size_t) K;
+            const float *  da_b = da + (size_t) b * (size_t) rows * (size_t) nb;
+            float *        C_b  = yp + (size_t) b * (size_t) rows * (size_t) N;
+
+            simd<uint32_t, 16> lane(0, 1);
+            simd<float, RC * 16> acc[MB][NT];
+#pragma unroll
+            for (int mb = 0; mb < MB; ++mb)
+#pragma unroll
+                for (int t = 0; t < NT; ++t) acc[mb][t] = 0.0f;
+            simd<uint32_t, 16> e0[NT];
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                e0[t] = ((lane + (uint32_t) (n0 + t * 16)) * (uint32_t) wr) / 2u;
+            }
+            for (int c0 = 0; c0 < nb; c0 += CH) {
+                for (int ic = li; ic < CH; ic += LG) {
+                    const int ib = c0 + ic;
+                    const uint32_t sbo = (uint32_t) ((ib >> 3) * 33);
+                    const uint32_t i8o = (uint32_t) ((ib & 7) * 4);
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        simd<uint32_t, 16> e = e0[t] + sbo;
+                        simd<uint16_t, 16> dq = gather<uint16_t, 16>(w16, e * 2u);
+                        simd<uint32_t, 16> q0 = gather<uint16_t, 16>(w16, (e + 1u + i8o) * 2u);
+                        simd<uint32_t, 16> q1 = gather<uint16_t, 16>(w16, (e + 2u + i8o) * 2u);
+                        simd<uint32_t, 16> q2 = gather<uint16_t, 16>(w16, (e + 3u + i8o) * 2u);
+                        simd<uint32_t, 16> q3 = gather<uint16_t, 16>(w16, (e + 4u + i8o) * 2u);
+                        simd<uint32_t, 16> aux32 = q2 | (q3 << 16);
+                        const uint32_t so = (uint32_t) ((ic * NT + t) * TB);
+#pragma unroll
+                        for (int il = 0; il < 4; ++il) {
+                            simd<uint32_t, 16> idx = (il < 2 ? q0 : q1);
+                            idx = (il & 1) ? (idx >> 8) : (idx & 255u);
+                            simd<uint32_t, 16> lo = gather<uint32_t, 16>(grid32, idx * 8u);
+                            simd<uint32_t, 16> hi = gather<uint32_t, 16>(grid32, idx * 8u + 4u);
+                            simd<uint32_t, 16> s7 = (aux32 >> (7 * il)) & 127u;
+                            simd<uint32_t, 16> sg = s7 | ((cbit(s7) & 1u) << 7);
+                            simd<uint32_t, 16> mlo = (((sg & 15u) * 0x00204081u) & 0x01010101u) * 255u;
+                            simd<uint32_t, 16> mhi = ((((sg >> 4) & 15u) * 0x00204081u) & 0x01010101u) * 255u;
+                            slm_block_store<uint32_t, 16>(so + (uint32_t) ((il * 2) * 64), (lo ^ mlo) + (mlo & 0x01010101u));
+                            slm_block_store<uint32_t, 16>(so + (uint32_t) ((il * 2 + 1) * 64), (hi ^ mhi) + (mhi & 0x01010101u));
+                        }
+                        simd<sycl::half, 16> dh = dq.template bit_cast_view<sycl::half>();
+                        simd<float, 16> dl = convert<float>(dh) * ((convert<float>(simd<uint32_t, 16>(aux32 >> 28)) + 0.5f) * 0.25f);
+                        slm_block_store<float, 16>(so + 512u, dl);
+                    }
+                }
+                barrier();
+                if (m0 < rows) {
+                    for (int ic = 0; ic < CH; ++ic) {
+                        const int ib = c0 + ic;
+                        simd<uint32_t, 128> Bd[NT];
+                        simd<float, 16> dl[NT];
+#pragma unroll
+                        for (int t = 0; t < NT; ++t) {
+                            const uint32_t so = (uint32_t) ((ic * NT + t) * TB);
+                            Bd[t] = slm_block_load<uint32_t, 128>(so);
+                            dl[t] = slm_block_load<float, 16>(so + 512u);
+                        }
+#pragma unroll
+                        for (int mb = 0; mb < MB; ++mb) {
+                            const int mr = m0 + mb * RC;
+                            if (mr < rows) {
+                                simd<int8_t, RC * 32> Am =
+                                    ex::lsc_load_2d<int8_t, 32, RC, 1, false, false>(A_b, aw, ah, aw, ib * 32, mr);
+                                float dar[RC];
+#pragma unroll
+                                for (int r = 0; r < RC; ++r) {
+                                    dar[r] = (mr + r) < rows ? da_b[(size_t) (mr + r) * (size_t) nb + (size_t) ib] : 0.0f;
+                                }
+#pragma unroll
+                                for (int t = 0; t < NT; ++t) {
+                                    simd<uint8_t, 512> Bw = Bd[t].template bit_cast_view<uint8_t>();
+                                    simd<int, RC * 16> Ci =
+                                        xmx::dpas<8, RC, int, int, uint8_t, int8_t, xmx::dpas_argument_type::s8, xmx::dpas_argument_type::s8>(
+                                            simd<int, RC * 16>(0), Bw, Am);
+#pragma unroll
+                                    for (int r = 0; r < RC; ++r) {
+                                        simd<int, 16> ci = Ci.template select<16, 1>(r * 16);
+                                        acc[mb][t].template select<16, 1>(r * 16) += convert<float>(ci) * (dl[t] * dar[r]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                barrier();
+            }
+            if (m0 >= rows) {
+                return;
+            }
+#pragma unroll
+            for (int mb = 0; mb < MB; ++mb) {
+#pragma unroll
+                for (int r = 0; r < RC; ++r) {
+                    const int m = m0 + mb * RC + r;
+                    if (m < rows) {
+#pragma unroll
+                        for (int t = 0; t < NT; ++t) {
+                            simd<float, 16> row = acc[mb][t].template select<16, 1>(r * 16);
+                            row.copy_to(C_b + (size_t) m * (size_t) N + (size_t) (n0 + t * 16));
+                        }
+                    }
+                }
+            }
+        });
+    return true;
+}
+
+template <int NT, int MB, int LG, int CHV>
+static bool launch_iq2_moe_slm_tiles(queue_ptr stream, const uint8_t * w, size_t we, size_t wr,
+                               const uint32_t * grid32, const int32_t * tiles, const int32_t * n_tiles_dev,
+                               const int8_t * A, const float * da, float * yp, int K, int N, int max_tiles,
+                               const int32_t * ri1 = nullptr, const int32_t * ri2 = nullptr, char * yout = nullptr,
+                               size_t y1 = 0, size_t y2 = 0) {
+    constexpr int RC = XE2MX_PF_RC;
+    constexpr int CH = CHV;
+    constexpr int TB = 512 + 64;
+    const int nb = K / 32;
+    const int nstep = 16 * NT;
+    if ((K % 256) != 0 || (N % nstep) != 0) {
+        return false;
+    }
+    const int n_tiles = N / nstep;
+    const unsigned aw = (unsigned) K - 1u;
+    const auto props = sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> };
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>((size_t) max_tiles, (size_t) LG, (size_t) n_tiles),
+                          sycl::range<3>(1, (size_t) LG, 1)),
+        props,
+        [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
+            slm_init<CH * NT * TB>();
+            const int ti = (int) it.get_global_id(0);
+            if (ti >= *n_tiles_dev) {
+                return;   // whole work-group exits together (ti is group-uniform)
+            }
+            const int64_t e_idx  = tiles[4 * ti + 0];
+            const int row_start  = tiles[4 * ti + 1];
+            const int rows       = tiles[4 * ti + 2];
+            const int li = (int) it.get_local_id(1);
+            const int m0 = tiles[4 * ti + 3] + li * RC * MB;
+            const unsigned ah = (unsigned) rows - 1u;
+            const int n0 = (int) it.get_global_id(2) * nstep;
+            const uint16_t * w16 = (const uint16_t *) (w + (size_t) e_idx * we);
+            const int8_t * A_b  = A + (size_t) row_start * (size_t) K;
+            const float *  da_b = da + (size_t) row_start * (size_t) nb;
+            float *        C_b  = yp + (size_t) row_start * (size_t) N;
+
+            simd<uint32_t, 16> lane(0, 1);
+            simd<float, RC * 16> acc[MB][NT];
+#pragma unroll
+            for (int mb = 0; mb < MB; ++mb)
+#pragma unroll
+                for (int t = 0; t < NT; ++t) acc[mb][t] = 0.0f;
+            simd<uint32_t, 16> e0[NT];
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                e0[t] = ((lane + (uint32_t) (n0 + t * 16)) * (uint32_t) wr) / 2u;
+            }
+            for (int c0 = 0; c0 < nb; c0 += CH) {
+                for (int ic = li; ic < CH; ic += LG) {
+                    const int ib = c0 + ic;
+                    const uint32_t sbo = (uint32_t) ((ib >> 3) * 33);
+                    const uint32_t i8o = (uint32_t) ((ib & 7) * 4);
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        simd<uint32_t, 16> e = e0[t] + sbo;
+                        simd<uint16_t, 16> dq = gather<uint16_t, 16>(w16, e * 2u);
+                        simd<uint32_t, 16> q0 = gather<uint16_t, 16>(w16, (e + 1u + i8o) * 2u);
+                        simd<uint32_t, 16> q1 = gather<uint16_t, 16>(w16, (e + 2u + i8o) * 2u);
+                        simd<uint32_t, 16> q2 = gather<uint16_t, 16>(w16, (e + 3u + i8o) * 2u);
+                        simd<uint32_t, 16> q3 = gather<uint16_t, 16>(w16, (e + 4u + i8o) * 2u);
+                        simd<uint32_t, 16> aux32 = q2 | (q3 << 16);
+                        const uint32_t so = (uint32_t) ((ic * NT + t) * TB);
+#pragma unroll
+                        for (int il = 0; il < 4; ++il) {
+                            simd<uint32_t, 16> idx = (il < 2 ? q0 : q1);
+                            idx = (il & 1) ? (idx >> 8) : (idx & 255u);
+                            simd<uint32_t, 16> lo = gather<uint32_t, 16>(grid32, idx * 8u);
+                            simd<uint32_t, 16> hi = gather<uint32_t, 16>(grid32, idx * 8u + 4u);
+                            simd<uint32_t, 16> s7 = (aux32 >> (7 * il)) & 127u;
+                            simd<uint32_t, 16> sg = s7 | ((cbit(s7) & 1u) << 7);
+                            simd<uint32_t, 16> mlo = (((sg & 15u) * 0x00204081u) & 0x01010101u) * 255u;
+                            simd<uint32_t, 16> mhi = ((((sg >> 4) & 15u) * 0x00204081u) & 0x01010101u) * 255u;
+                            slm_block_store<uint32_t, 16>(so + (uint32_t) ((il * 2) * 64), (lo ^ mlo) + (mlo & 0x01010101u));
+                            slm_block_store<uint32_t, 16>(so + (uint32_t) ((il * 2 + 1) * 64), (hi ^ mhi) + (mhi & 0x01010101u));
+                        }
+                        simd<sycl::half, 16> dh = dq.template bit_cast_view<sycl::half>();
+                        simd<float, 16> dl = convert<float>(dh) * ((convert<float>(simd<uint32_t, 16>(aux32 >> 28)) + 0.5f) * 0.25f);
+                        slm_block_store<float, 16>(so + 512u, dl);
+                    }
+                }
+                barrier();
+                if (m0 < rows) {
+                    for (int ic = 0; ic < CH; ++ic) {
+                        const int ib = c0 + ic;
+                        simd<uint32_t, 128> Bd[NT];
+                        simd<float, 16> dl[NT];
+#pragma unroll
+                        for (int t = 0; t < NT; ++t) {
+                            const uint32_t so = (uint32_t) ((ic * NT + t) * TB);
+                            Bd[t] = slm_block_load<uint32_t, 128>(so);
+                            dl[t] = slm_block_load<float, 16>(so + 512u);
+                        }
+#pragma unroll
+                        for (int mb = 0; mb < MB; ++mb) {
+                            const int mr = m0 + mb * RC;
+                            if (mr < rows) {
+                                simd<int8_t, RC * 32> Am =
+                                    ex::lsc_load_2d<int8_t, 32, RC, 1, false, false>(A_b, aw, ah, aw, ib * 32, mr);
+                                float dar[RC];
+#pragma unroll
+                                for (int r = 0; r < RC; ++r) {
+                                    dar[r] = (mr + r) < rows ? da_b[(size_t) (mr + r) * (size_t) nb + (size_t) ib] : 0.0f;
+                                }
+#pragma unroll
+                                for (int t = 0; t < NT; ++t) {
+                                    simd<uint8_t, 512> Bw = Bd[t].template bit_cast_view<uint8_t>();
+                                    simd<int, RC * 16> Ci =
+                                        xmx::dpas<8, RC, int, int, uint8_t, int8_t, xmx::dpas_argument_type::s8, xmx::dpas_argument_type::s8>(
+                                            simd<int, RC * 16>(0), Bw, Am);
+#pragma unroll
+                                    for (int r = 0; r < RC; ++r) {
+                                        simd<int, 16> ci = Ci.template select<16, 1>(r * 16);
+                                        acc[mb][t].template select<16, 1>(r * 16) += convert<float>(ci) * (dl[t] * dar[r]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                barrier();
+            }
+            if (m0 >= rows) {
+                return;
+            }
+#pragma unroll
+            for (int mb = 0; mb < MB; ++mb) {
+#pragma unroll
+                for (int r = 0; r < RC; ++r) {
+                    const int m = m0 + mb * RC + r;
+                    if (m < rows) {
+#pragma unroll
+                        for (int t = 0; t < NT; ++t) {
+                            simd<float, 16> row = acc[mb][t].template select<16, 1>(r * 16);
+                            if (yout) {
+                                const int gr = row_start + m;
+                                const int32_t i1 = ri1[gr];
+                                if (i1 >= 0) {
+                                    row.copy_to((float *) (yout + (size_t) i1 * y1 + (size_t) ri2[gr] * y2) + (n0 + t * 16));
+                                }
+                            } else {
+                                row.copy_to(C_b + (size_t) m * (size_t) N + (size_t) (n0 + t * 16));
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    return true;
+}
+
 } // namespace
 
 #endif
@@ -5177,6 +5968,142 @@ bool ggml_sycl_xe2mx_lo_s44_glu(ggml_backend_sycl_context & ctx,
     GGML_UNUSED(N);
     GGML_UNUSED(M);
     GGML_UNUSED(g);
+    return false;
+#endif
+}
+
+bool ggml_sycl_xe2mx_moe_dpas(ggml_backend_sycl_context & ctx,
+                              const uint8_t * wp_soa,
+                              const int64_t * ep,
+                              const int8_t * A,
+                              const float * da,
+                              float * yp,
+                              int K,
+                              int N,
+                              int rows,
+                              int batch) {
+#ifdef GGML_SYCL_XE2MX_XMX_HAS_ESIMD
+    if (wp_soa == nullptr || A == nullptr || da == nullptr || yp == nullptr) {
+        return false;
+    }
+    if ((K % 64) != 0 || K < 128 || (N % 16) != 0 || N <= 0 || rows <= 0 || batch <= 0) {
+        return false;
+    }
+    try {
+        if ((N % 128) == 0 && ggml_sycl_get_env("GGML_SYCL_XE2MX_MOE_NT", 8) == 8) {
+            return launch_moe_id_nt<8>(ctx.stream(), wp_soa, ep, A, da, yp, K, N, rows, batch);
+        }
+        if ((N % 64) == 0) {
+            return launch_moe_id_nt<4>(ctx.stream(), wp_soa, ep, A, da, yp, K, N, rows, batch);
+        }
+        return launch_moe_id_nt<1>(ctx.stream(), wp_soa, ep, A, da, yp, K, N, rows, batch);
+    } catch (const sycl::exception & e) {
+        GGML_SYCL_XE2_LOG("xe2mx moe dpas: %s\n", e.what());
+        fflush(stderr);
+        return false;
+    }
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(wp_soa);
+    GGML_UNUSED(ep);
+    GGML_UNUSED(A);
+    GGML_UNUSED(da);
+    GGML_UNUSED(yp);
+    GGML_UNUSED(K);
+    GGML_UNUSED(N);
+    GGML_UNUSED(rows);
+    GGML_UNUSED(batch);
+    return false;
+#endif
+}
+
+bool ggml_sycl_xe2mx_moe_tiles(ggml_backend_sycl_context & ctx, const uint8_t * wp_soa, const int32_t * tiles,
+                               const int32_t * n_tiles_dev, const int8_t * A, const float * da, float * yp,
+                               int K, int N, int max_tiles, const int32_t * ri1, const int32_t * ri2, char * yout,
+                               size_t y1, size_t y2) {
+#ifdef GGML_SYCL_XE2MX_XMX_HAS_ESIMD
+    if ((K % 64) != 0 || K < 128 || (N % 16) != 0 || max_tiles <= 0) {
+        return false;
+    }
+    if (yout && !ggml_sycl_xe2mx_moe_tiles_can_fuse(N)) {
+        return false;  // caller asked for a dst store the selected variant cannot do
+    }
+    try {
+        static const int tmb = ggml_sycl_get_env("GGML_SYCL_XE2MX_MOE_TILE_MB", 0);
+        if (tmb == 2 && (N % 64) == 0)  return launch_moe_tiles_mb<4, 2>(ctx.stream(), wp_soa, tiles, n_tiles_dev, A, da, yp, K, N, max_tiles, ri1, ri2, yout, y1, y2);
+        if ((N % 128) == 0 && ggml_sycl_get_env("GGML_SYCL_XE2MX_MOE_NT", 8) == 8) {
+            return launch_moe_tiles_nt<8>(ctx.stream(), wp_soa, tiles, n_tiles_dev, A, da, yp, K, N, max_tiles);
+        }
+        if ((N % 64) == 0) {
+            return launch_moe_tiles_nt<4>(ctx.stream(), wp_soa, tiles, n_tiles_dev, A, da, yp, K, N, max_tiles);
+        }
+        return launch_moe_tiles_nt<1>(ctx.stream(), wp_soa, tiles, n_tiles_dev, A, da, yp, K, N, max_tiles);
+    } catch (const sycl::exception & e) {
+        GGML_SYCL_XE2_LOG("xe2mx moe tiles: %s\n", e.what());
+        return false;
+    }
+#else
+    GGML_UNUSED(ctx); GGML_UNUSED(wp_soa); GGML_UNUSED(tiles); GGML_UNUSED(n_tiles_dev); GGML_UNUSED(A);
+    GGML_UNUSED(da); GGML_UNUSED(yp); GGML_UNUSED(K); GGML_UNUSED(N); GGML_UNUSED(max_tiles);
+    return false;
+#endif
+}
+
+int ggml_sycl_xe2mx_moe_tile_span() { return XE2MX_PF_RC * XE2MX_PF_LGS; }
+
+// Must mirror the variant selection in ggml_sycl_xe2mx_moe_tiles: only <4,2> stores rows to dst.
+bool ggml_sycl_xe2mx_moe_tiles_can_fuse(int N) {
+    static const int tmb = ggml_sycl_get_env("GGML_SYCL_XE2MX_MOE_TILE_MB", 0);
+    return tmb == 2 && (N % 64) == 0;
+}
+
+// Must mirror the variant selection in ggml_sycl_iq2_moe_tiles.
+bool ggml_sycl_iq2_moe_tiles_can_fuse(int N) {
+    return (N % 64) == 0;
+}
+
+bool ggml_sycl_iq2_moe_tiles(ggml_backend_sycl_context & ctx, const uint8_t * w, size_t we, size_t wr,
+                             const uint32_t * grid32, const int32_t * tiles, const int32_t * n_tiles_dev,
+                             const int8_t * A, const float * da, float * yp, int K, int N, int max_tiles,
+                             const int32_t * ri1, const int32_t * ri2, char * yout, size_t y1, size_t y2) {
+#ifdef GGML_SYCL_XE2MX_XMX_HAS_ESIMD
+    if (yout && !ggml_sycl_iq2_moe_tiles_can_fuse(N)) {
+        return false;  // caller asked for a dst store the selected variant cannot do
+    }
+    try {
+        if ((N % 64) == 0) {
+            return launch_iq2_moe_slm_tiles<4, 4, 8, 8>(ctx.stream(), w, we, wr, grid32, tiles, n_tiles_dev, A, da, yp, K, N, max_tiles,
+                                                     ri1, ri2, yout, y1, y2);
+        }
+        return false;
+    } catch (const sycl::exception & e) {
+        GGML_SYCL_XE2_LOG("iq2 moe tiles: %s\n", e.what());
+        return false;
+    }
+#else
+    GGML_UNUSED(ctx); GGML_UNUSED(w); GGML_UNUSED(we); GGML_UNUSED(wr); GGML_UNUSED(grid32); GGML_UNUSED(tiles);
+    GGML_UNUSED(n_tiles_dev); GGML_UNUSED(A); GGML_UNUSED(da); GGML_UNUSED(yp); GGML_UNUSED(K); GGML_UNUSED(N); GGML_UNUSED(max_tiles);
+    return false;
+#endif
+}
+int ggml_sycl_iq2_moe_tile_span() { return XE2MX_PF_RC * 4 * 8; }
+
+bool ggml_sycl_iq2_moe_dpas(ggml_backend_sycl_context & ctx, const uint8_t * w, const int64_t * ep, size_t we, size_t wr,
+                            const uint32_t * grid32, const int8_t * A, const float * da, float * yp,
+                            int K, int N, int rows, int batch) {
+#ifdef GGML_SYCL_XE2MX_XMX_HAS_ESIMD
+    try {
+        if ((N % 32) == 0) {
+            const int slm = ggml_sycl_get_env("GGML_SYCL_IQ2_MOE_SLM", 0);
+            if (slm == 48) return launch_iq2_moe_slm<4, 4, 8>(ctx.stream(), w, ep, we, wr, grid32, A, da, yp, K, N, rows, batch);
+            return launch_iq2_moe_id_nt<2, 4>(ctx.stream(), w, ep, we, wr, grid32, A, da, yp, K, N, rows, batch);
+        }
+        return launch_iq2_moe_id_nt<1, 4>(ctx.stream(), w, ep, we, wr, grid32, A, da, yp, K, N, rows, batch);
+    } catch (const sycl::exception & e) {
+        GGML_SYCL_XE2_LOG("iq2 moe dpas: %s\n", e.what());
+        return false;
+    }
+#else
     return false;
 #endif
 }

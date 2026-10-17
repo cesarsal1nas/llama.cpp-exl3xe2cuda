@@ -716,7 +716,10 @@ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
 
-    if (ggml_sycl_get_env("GGML_SYCL_XE2MX_S44RMSHILP", 0)
+    // The hilp kernel reads mul[col] only, so it is correct for a single-row weight.
+    // Grouped norms (Mamba-2 ssm_norm: one weight row per group) broadcast mul by row.
+    const bool mul_one_row = mul_src && ggml_nrows(mul_src) == 1;
+    if (ggml_sycl_get_env("GGML_SYCL_XE2MX_S44RMSHILP", 0) && mul_one_row
         && mul_tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(mul_tensor)
         && ggml_is_contiguous(rms_norm_src) && mul_src && ggml_is_contiguous(mul_src)
         && (ne00 % 128) == 0 && ne00 >= 128 && ggml_nrows(mul_tensor) >= 32) {
@@ -728,7 +731,7 @@ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * 
     rms_norm_mul_f32_sycl(src0_dd, mul_dd, dst_dd, ne00, ne01, ne02, ne03,
         s00, s01, s02, s03, d00, d01, d02, d03,
         mul_s01, mul_s02, mul_s03, mul_nrows, mul_nchannels, mul_nsamples, eps, main_stream, ctx.device);
-    if (ggml_sycl_get_env("GGML_SYCL_XE2MX_S44RMSPACK", 0)
+    if (ggml_sycl_get_env("GGML_SYCL_XE2MX_S44RMSPACK", 0) && mul_one_row
         && mul_tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(mul_tensor)
         && (ne00 % 128) == 0 && ne00 >= 128 && ggml_nrows(mul_tensor) >= 32) {
         ggml_sycl_xe2mx_s44_pack_xf(main_stream, mul_tensor, dst_dd, ggml_nrows(mul_tensor), ne00);

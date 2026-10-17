@@ -14,6 +14,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+void llama_lab_set_prompt_end(int32_t n); // src/llama-ext.h (C++ linkage)
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -1156,6 +1157,12 @@ private:
 
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
                 params_base.speculative.draft.ctx_dft = ctx_dft;
+                params_base.speculative.draft.ctx_mtp = spec_init->context_mtp();
+
+                if (!common_memory_overcommit_check({ ctx_tgt, ctx_dft })) {
+                    SRV_ERR("%s", "target plus draft model do not fit in device memory\n");
+                    return false;
+                }
             }
 
             load_progress_callback(1.0f, &load_progress_spec);
@@ -3139,6 +3146,7 @@ private:
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
+                        llama_lab_set_prompt_end((int32_t) slot.task->n_tokens()); // drafter feature tail by prompt length
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
@@ -3545,11 +3553,14 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
+                        // XE2_CKPT_STREAM=1 keeps only the last-user and 4-token-tail breaks, so the long
+                        // middle of the prompt reaches llama_decode as one multi-ubatch call (prefill pair can overlap)
+                        static const bool ckpt_stream = getenv("XE2_CKPT_STREAM") && atoi(getenv("XE2_CKPT_STREAM")) == 1;
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if (pos == last_user_pos || (!ckpt_stream && (checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step))) {
                                 break;
                             }
                         }
@@ -3564,6 +3575,9 @@ private:
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
+                                if (ckpt_stream && offset != 4) {
+                                    continue;
+                                }
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;

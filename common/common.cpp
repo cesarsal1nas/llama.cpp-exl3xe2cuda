@@ -1439,11 +1439,27 @@ void common_init_result::reset_samplers() {
     }
 }
 
+void common_init_result::reset_context() {
+    pimpl->samplers.clear();
+    pimpl->context.reset();
+}
+
 std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    // Deep recurrent rollback needs the SYCL conv-concat fusion guard. Mode 2 skips
+    // 3..64-token verify batches while preserving fusion for cheap MTP and prefill.
+    // An explicit XE2_LAB_NO_CONV_FUSE in the environment wins.
+    if (params.speculative.need_n_rs_seq() + 1 > 2) {
+        if (setenv("XE2_LAB_NO_CONV_FUSE", "2", 0) == 0) {
+            const char * v = std::getenv("XE2_LAB_NO_CONV_FUSE");
+            COM_INF("recurrent rollback depth %u: XE2_LAB_NO_CONV_FUSE=%s\n",
+                    params.speculative.need_n_rs_seq() + 1, v ? v : "?");
+        }
+    }
+
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();
@@ -1518,6 +1534,13 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
 
+    // refuse before the warmup touches buffers that do not fit: an over-committed device can
+    // silently spill to system memory and run ~100x slower instead of failing the allocation
+    if (!common_memory_overcommit_check({ lctx })) {
+        res->reset_context();
+        return res;
+    }
+
     if (params.warmup) {
         COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
 
@@ -1550,11 +1573,20 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         }
         // s4 oneDNN kernels are generated on the first M=ubatch GEMM. Do that here,
         // before the server accepts, so the timed request does not pay the compile.
-        if (std::getenv("GGML_SYCL_XE2MX_PREFILL_WARM") && llama_model_has_decoder(model)) {
-            const int nwarm = std::max(params.n_ubatch, 32);
+        // GGML_SYCL_XE2MX_PREFILL_WARM=N warms N ubatches in one decode (N>=2 also runs the second OWN_PIPE
+        // prefill slot), then one token so the prefill->decode owner copies run here, not in the first chat.
+        if (const char * pw = std::getenv("GGML_SYCL_XE2MX_PREFILL_WARM"); pw && llama_model_has_decoder(model)) {
+            const int nub = std::max(1, atoi(pw));
+            int nwarm = std::max(params.n_ubatch, 32) * nub;
+            nwarm = std::min(nwarm, (int) params.n_batch);
+            nwarm = std::min(nwarm, (int) llama_n_ctx(lctx) - (int) tmp.size() - 2);
             if (nwarm > (int) tmp.size()) {
                 std::vector<llama_token> big((size_t) nwarm, tmp[0]);
                 llama_decode(lctx, llama_batch_get_one(big.data(), big.size()));
+                if (nub > 1) {
+                    llama_token one = tmp[0];
+                    llama_decode(lctx, llama_batch_get_one(&one, 1));
+                }
             }
         }
         llama_memory_clear(llama_get_memory(lctx), true);
@@ -1741,6 +1773,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    // Override the per-sequence recurrent rollback depth for this context.
+    if (const char * e = std::getenv("XE2_LAB_RS_SEQ")) {
+        cparams.n_rs_seq = (uint32_t) atoi(e);
+    }
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;

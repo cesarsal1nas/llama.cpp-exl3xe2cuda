@@ -45,6 +45,12 @@ void common_fit_print(
 
 void common_memory_breakdown_print(const llama_context * ctx);
 
+// Sums the device buffers of every context in ctxs (e.g. target plus draft) per device of the first
+// context's model and compares them with each device's total memory. Logs an error and returns false
+// if any device is over-committed: some drivers (e.g. Intel xe) evict VRAM to system memory instead
+// of failing the allocation, which makes inference orders of magnitude slower instead of erroring.
+bool common_memory_overcommit_check(const std::vector<const llama_context *> & ctxs);
+
 struct common_device_memory_data {
     int64_t total;
     int64_t free;

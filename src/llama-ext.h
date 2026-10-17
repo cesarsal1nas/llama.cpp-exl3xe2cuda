@@ -117,6 +117,10 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
+// lab (single slot): absolute prompt length of the request being prefilled; 0 = unknown
+LLAMA_API void    llama_lab_set_prompt_end(int32_t n);
+LLAMA_API int32_t llama_lab_get_prompt_end(void);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 // Gather the first n_short columns of the draft MTP lm_head. n_short <= 0 clears.

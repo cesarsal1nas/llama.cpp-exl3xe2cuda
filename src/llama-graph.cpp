@@ -1398,6 +1398,7 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     fused_nodes.clear();
+    fa_masks.clear();
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
@@ -1415,6 +1416,10 @@ void llm_graph_result::reset() {
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     for (auto & input : inputs) {
         input->set_input(ubatch);
+    }
+    // op_params[5] of FLASH_ATTN_EXT = causal-contiguous valid KV length for this ubatch (0 = unknown, use mask)
+    for (auto & fm : fa_masks) {
+        fm.first->op_params[5] = fm.second->op_params[0];
     }
 }
 
@@ -1434,7 +1439,7 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
-            if (embeddings_layer_inp[il]) {
+            if (embeddings_layer_inp[il] && params.layer_inp_out) {
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
                 ggml_set_output(t_layer_inp[il]);
             }
@@ -2744,6 +2749,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        {
+            ggml_tensor * root = kq_mask;
+            while (root && root->op != GGML_OP_NONE) {
+                root = root->view_src ? root->view_src : root->src[0];
+            }
+            if (root) {
+                res->add_fa_mask(cur, root);
+            }
+        }
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);

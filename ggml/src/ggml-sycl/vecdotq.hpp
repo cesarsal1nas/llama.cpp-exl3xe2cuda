@@ -984,6 +984,18 @@ static __dpct_inline__ float vec_dot_q8_1_q8_1_impl(const int *v, const int *u,
 }
 
 static __dpct_inline__ float
+vec_dot_xe2mx4_q8_1_moe(const void * __restrict__ vbq,
+                       const block_q8_1 * __restrict__ bq8, const int & iqs) {
+    const block_xe2mx4 * w = (const block_xe2mx4 *) vbq;
+    const uint32_t q0 = w->qs[2 * iqs];
+    const uint32_t q1 = w->qs[2 * iqs + 1];
+    const int weights = (int) ((q0 & 15) | ((q0 >> 4) << 8) | ((q1 & 15) << 16) | ((q1 >> 4) << 24));
+    const int activations = get_int_from_int8_aligned(bq8->qs, iqs);
+    const int dot = dpct::dp4a(weights, activations, 0) - dpct::dp4a(0x08080808, activations, 0);
+    return (float) w->d * (float) bq8->ds[0] * dot;
+}
+
+static __dpct_inline__ float
 vec_dot_q4_0_q8_1(const void *__restrict__ vbq,
                   const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
 

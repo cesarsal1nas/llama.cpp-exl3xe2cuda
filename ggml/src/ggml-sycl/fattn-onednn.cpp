@@ -1888,7 +1888,25 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     // compile once per (device, shape, KV strides), reuse across layers/calls. Stride 2 always
     // repeats stride 1 and stride 4 is always 1, so the key covers every entry that can differ.
     static std::unordered_map<std::string, sdpa_partition> cache;
-    const int causal = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_CAUSAL", 1);
+    int causal = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_CAUSAL", 1);
+    // The implicit causal graph aligns queries to the end of the KV window: col <= row + fa_seq - q.
+    // That is only the real mask when fa_seq is the true valid length (llama passes it in op_params[5]).
+    // Padded n_kv would let each query see future tokens of this ubatch and stale padding cells.
+    {
+        const int32_t Lv = ggml_get_op_params_i32(dst, 5);
+        if (causal && !u4_run) {
+            if (Lv >= q && Lv <= seq && fa_seq == seq) {
+                fa_seq = Lv;
+            } else if (fa_seq == seq) {
+                causal = 0;
+            }
+        }
+        static int nlv = 0;
+        if (nlv < 6) {
+            nlv++;
+            GGML_SYCL_XE2_LOG("xe2mx fa onednn valid_kv=%d seq=%ld q=%ld causal=%d fa_seq=%ld\n", (int) Lv, (long) seq, (long) q, causal, (long) fa_seq);
+        }
+    }
     char keyb[256];
     snprintf(keyb, sizeof(keyb), "%d:%d:%d:%d:%d:%d:%d:%d:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld", ggml_sycl_get_device(),
              ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_FPM", 0), causal, u4_run ? 1 : 0,

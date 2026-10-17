@@ -2073,6 +2073,7 @@ static void mul_mat_vec_q6_K_q8_1_sycl_switch_ncols(
 }
 
 
+
 static void mul_mat_vec_iq2_xxs_q8_1_sycl(const void *vx, const void *vy,
                                           float *dst, const int ncols,
                                           const int nrows,
@@ -2755,6 +2756,12 @@ static void mul_mat_vec_q_moe(
     }
 }
 
+// IQ2_XXS dot with the grid/sign tables bound, so the generic MoE launcher can take it
+static __dpct_inline__ float vec_dot_iq2_xxs_q8_1_moe(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+                                                    const int & iqs) {
+    return vec_dot_iq2_xxs_q8_1(vbq, bq8_1, iqs, iq2xxs_grid, ksigns_iq2xs, kmask_iq2xs);
+}
+
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
 static void launch_mul_mat_vec_q_moe(
     const void * vx_base, const void * vy, const int32_t * ids_dev,
@@ -2872,6 +2879,20 @@ bool ggml_sycl_mul_mat_vec_q_id(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
             return true;
+        case GGML_TYPE_XE2MX4:
+            if (ncols % QK_XE2MX4 != 0) { return false; }
+            launch_mul_mat_vec_q_moe<QK_XE2MX4, QI_XE2MX4, block_xe2mx4, 1, vec_dot_xe2mx4_q8_1_moe>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            return true;
+        case GGML_TYPE_IQ2_XXS:
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            launch_mul_mat_vec_q_moe<QK_K, QI2_XXS / 2, block_iq2_xxs, 1, vec_dot_iq2_xxs_q8_1_moe>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            return true;
         case GGML_TYPE_IQ4_XS:
             if (ncols % QK_K != 0) {
                 return false;
@@ -2974,6 +2995,72 @@ static void launch_mul_mat_vec_q_moe_reorder(
     });
 }
 
+static void launch_mul_mat_vec_q_moe_xe2mx4_soa(
+    const void * vx_base, const void * vy_base, const int32_t * ids_base,
+    float * dst_base, const int ncols, const int nrows, const int n_experts_used,
+    const size_t expert_weight_stride, const size_t dst_row_stride,
+    const size_t src1_row_stride,
+    int n_tokens, size_t ids_tok_stride, size_t dst_tok_stride, size_t src1_tok_stride,
+    dpct::queue_ptr stream) {
+    const int            block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const unsigned       ntok        = (unsigned) (n_tokens > 0 ? n_tokens : 1);
+    const sycl::range<3> block_nums(ntok, (unsigned) n_experts_used, (unsigned) block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                const int tok        = item_ct1.get_group(0);
+                const int expert_idx = item_ct1.get_group(1);
+                const int32_t * ids_dev = (const int32_t *) ((const char *) ids_base + (size_t) tok * ids_tok_stride);
+                const int i02        = ids_dev[expert_idx];
+                const uint8_t * vx   = (const uint8_t *) vx_base + (size_t) i02 * expert_weight_stride;
+                const uint8_t * vy   = (const uint8_t *) vy_base + (size_t) tok * src1_tok_stride
+                                     + (size_t) expert_idx * src1_row_stride;
+                float * dst          = (float *) ((char *) dst_base + (size_t) tok * dst_tok_stride
+                                     + (size_t) expert_idx * dst_row_stride);
+                const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+                if (row >= nrows) {
+                    return;
+                }
+                const auto sg             = item_ct1.get_sub_group();
+                const int  lane           = sg.get_local_linear_id();
+                const int  blocks_per_row = ncols / QK_XE2MX4;
+                const size_t pitch        = (size_t) blocks_per_row * 16;
+                const uint32_t * qrow     = (const uint32_t *) (vx + (size_t) row * pitch);
+                const sycl::half * dpl    = (const sycl::half *) (vx + (size_t) nrows * pitch);
+                const int32_t * q8_ptr    = (const int32_t *) vy;
+                const sycl::half2 * ds8   = (const sycl::half2 *) (vy + ncols);
+
+                float partial_sum = 0.0f;
+                for (int ib = lane; ib < blocks_per_row; ib += WARP_SIZE) {
+                    const float d = (float) dpl[(size_t) ib * (size_t) nrows + (size_t) row];
+                    const sycl::float2 ds8f = ds8[ib].convert<float, sycl::rounding_mode::automatic>();
+                    const sycl::vec<uint32_t, 4> q4 = *reinterpret_cast<const sycl::vec<uint32_t, 4> *>(qrow + (size_t) ib * 4);
+                    const sycl::vec<int32_t, 8>  q8 = *reinterpret_cast<const sycl::vec<int32_t, 8> *>(q8_ptr + (size_t) ib * 8);
+                    int sumi = 0;
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const uint32_t v = q4[j];
+                        const uint32_t b0 = v & 0xffu;
+                        const uint32_t b1 = (v >> 8) & 0xffu;
+                        const uint32_t b2 = (v >> 16) & 0xffu;
+                        const uint32_t b3 = (v >> 24) & 0xffu;
+                        const int w0 = (int) ((b0 & 15u) | ((b0 >> 4) << 8) | ((b1 & 15u) << 16) | ((b1 >> 4) << 24));
+                        const int w1 = (int) ((b2 & 15u) | ((b2 >> 4) << 8) | ((b3 & 15u) << 16) | ((b3 >> 4) << 24));
+                        sumi = dpct::dp4a(w0, q8[2 * j + 0], sumi);
+                        sumi = dpct::dp4a(w1, q8[2 * j + 1], sumi);
+                    }
+                    partial_sum += d * (sumi * ds8f.x() - 8.0f * ds8f.y());
+                }
+                const float sum = sycl::reduce_over_group(sg, partial_sum, std::plus<>());
+                if (sg.leader()) {
+                    dst[row] = sum;
+                }
+            });
+    });
+}
+
 bool ggml_sycl_mul_mat_vec_q_id_reorder(
     enum ggml_type     src0_type,
     const void *       vx_base,
@@ -3016,6 +3103,15 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
                 return false;
             }
             launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_XS>>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride,
+                ntok, ids_tok_stride, dst_tok_stride, src1_tok_stride, stream);
+            return true;
+        case GGML_TYPE_XE2MX4:
+            if (ncols % QK_XE2MX4 != 0) {
+                return false;
+            }
+            launch_mul_mat_vec_q_moe_xe2mx4_soa(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                 expert_weight_stride, dst_row_stride, src1_row_stride,
                 ntok, ids_tok_stride, dst_tok_stride, src1_tok_stride, stream);

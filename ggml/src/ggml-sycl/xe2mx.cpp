@@ -26,6 +26,7 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -238,7 +239,13 @@ static size_t g_xe2mx_s8r_ex_used = 0;
 // memory. It is uploaded before the first large GEMM of a prompt and dropped
 // when decode starts. Decode reads the original tensor bytes only.
 static bool xe2mx_lo_hp_on(void) {
-    static const int on = ggml_sycl_get_env("GGML_SYCL_XE2MX_LO_HOSTPACK", 0);
+    static const int on = [] {
+        const char * e = getenv("GGML_SYCL_XE2MX_LO_HOSTPACK");
+        if (e) {
+            return atoi(e);
+        }
+        return ggml_sycl_info().device_count > 1 ? 0 : 1;
+    }();
     return on != 0;
 }
 static bool g_xe2mx_lo_hp_resident = true;
@@ -321,6 +328,7 @@ struct xe2mx_nf_keep_ent {
     const void * key;
     size_t bytes;
     bool extra;
+    int dev;
 };
 static std::vector<xe2mx_nf_keep_ent> g_xe2mx_nf_keep_ents;
 static size_t g_xe2mx_nf_keep_used = 0;
@@ -461,9 +469,11 @@ static void xe2mx_lo_hostpack_fence(sycl::queue & q, xe2mx_wcache & v) {
 
 static void xe2mx_nf_hp_register(sycl::queue & q, xe2mx_wcache & v, const void * key = nullptr,
                                   bool extra = false) {
+    const int dev = xe2mx_q_dev(q);
+    v.hp_dev = dev;
     if (xe2mx_nf_rebake_on() && key && v.packed
         && ggml_sycl_get_env("GGML_SYCL_XE2MX_LO_NOPACK_FFN", 0)) {
-        g_xe2mx_nf_keep_ents.push_back({ key, v.bytes, extra });
+        g_xe2mx_nf_keep_ents.push_back({ key, v.bytes, extra, dev });
         return;
     }
     if (!xe2mx_nf_hp_on() || !v.packed) {
@@ -507,9 +517,9 @@ static void xe2mx_lo_hostpack_drop(sycl::queue & q) {
     q.wait();
     // First pass only: pin the earliest packs (in use order) on the device so the
     // first layers of every prompt do not wait for the copy.
-    static bool pin_done = false;
-    if (!pin_done) {
-        pin_done = true;
+    static bool pin_done[GGML_SYCL_MAX_DEVICES] = {};
+    if (!pin_done[dev]) {
+        pin_done[dev] = true;
         const size_t pin_cap = (size_t) ggml_sycl_get_env("GGML_SYCL_XE2MX_LO_HOSTPACK_KEEP_MB", 0) << 20;
         std::vector<xe2mx_wcache *> all;
         for (auto & kv : g_xe2mx_lo_w) {
@@ -565,24 +575,28 @@ static void xe2mx_lo_hostpack_drop(sycl::queue & q) {
         ggml_sycl_free_device(g_xe2mx_lo_hp_arena_dev[dev], q);
         g_xe2mx_lo_hp_arena_dev[dev] = nullptr;
     }
-    for (const xe2mx_nf_keep_ent & e : g_xe2mx_nf_keep_ents) {
-        auto it = g_xe2mx_wcache.find(e.key);
-        if (it == g_xe2mx_wcache.end()) {
+    for (auto it_ent = g_xe2mx_nf_keep_ents.begin(); it_ent != g_xe2mx_nf_keep_ents.end(); ) {
+        const xe2mx_nf_keep_ent & e = *it_ent;
+        if (e.dev != dev) {
+            ++it_ent;
             continue;
         }
-        if (it->second.packed) {
-            ggml_sycl_free_device(it->second.packed, q);
+        auto it = g_xe2mx_wcache.find(e.key);
+        if (it != g_xe2mx_wcache.end()) {
+            if (it->second.packed) {
+                ggml_sycl_free_device(it->second.packed, q);
+            }
+            freed += e.bytes;
+            g_xe2mx_nf_keep_used -= e.bytes;
+            if (e.extra) {
+                g_xe2mx_s8r_ex_used -= e.bytes;
+            } else {
+                g_xe2mx_wcache_used -= e.bytes;
+            }
+            g_xe2mx_wcache.erase(it);
         }
-        freed += e.bytes;
-        g_xe2mx_nf_keep_used -= e.bytes;
-        if (e.extra) {
-            g_xe2mx_s8r_ex_used -= e.bytes;
-        } else {
-            g_xe2mx_wcache_used -= e.bytes;
-        }
-        g_xe2mx_wcache.erase(it);
+        it_ent = g_xe2mx_nf_keep_ents.erase(it_ent);
     }
-    g_xe2mx_nf_keep_ents.clear();
     xe2mx_hp_res(dev) = false;
     static int nlog = 0;
     if (nlog < 8) {
@@ -674,11 +688,12 @@ bool ggml_sycl_xe2mx_lo_on(const ggml_tensor * t) {
     if (nmin < 16) {
         nmin = 4096;
     }
-    if ((ggml_sycl_get_env("GGML_SYCL_XE2MX_LO_NOPACK_FFN", 0) && (N >= 16384 || K >= 16384))) {
+    const bool ffn = N >= 16384 || K >= 16384;
+    if (ggml_sycl_get_env("GGML_SYCL_XE2MX_LO_NOPACK_FFN", 0) && ffn) {
         // no LO pack for FFN: exact SOA decode, prefill via SOA/S44 temp path, frees ~8.7 GiB
         return false;
     }
-    if (ggml_sycl_get_env("GGML_SYCL_XE2MX_LO_NOPACK_MID", 0) && !(N >= 16384 || K >= 16384)) {
+    if (ggml_sycl_get_env("GGML_SYCL_XE2MX_LO_NOPACK_MID", 0) && !ffn) {
         // no LO pack for attn/mid: exact original decode, prefill via plain xe2mx path, frees ~3.35 GiB
         return false;
     }
@@ -2659,7 +2674,7 @@ static int xe2mx_s44_h_on(int layer, int64_t K, int64_t N = 0) {
         return 0;
     }
     const int hfrom = ggml_sycl_get_env("GGML_SYCL_XE2MX_S44HFROM", 0);
-    const int hto = ggml_sycl_get_env("GGML_SYCL_XE2MX_S44HTO", 64);
+    const int hto = ggml_sycl_get_env("GGML_SYCL_XE2MX_S44HTO", 256);
     if (layer < 0) {
         if (ggml_sycl_get_env("GGML_SYCL_XE2MX_S44HSKIPDN", 0) && K >= 16384) {
             return 0;
@@ -4247,9 +4262,21 @@ static bool xe2mx_s44_cached(queue_ptr stream, const uint8_t * packed, int64_t K
         && (N >= 16384 || K >= 16384)) {
         // NOPACK_FFN transient bake: FFN has no persistent LO pack (decode reads exact original SOA);
         // prefill re-bakes the s4 pack into reusable scratch each call. In-order queue keeps it safe.
-        static void * nf_f = nullptr; static size_t nf_fcap = 0;
-        static void * nf_8 = nullptr; static size_t nf_8cap = 0;
-        static void * nf_w = nullptr; static size_t nf_wcap = 0;
+        struct nf_buffers {
+            void * f = nullptr, * w8 = nullptr, * w4 = nullptr;
+            size_t fcap = 0, cap8 = 0, cap4 = 0;
+            std::unordered_map<const void *, float *> scales;
+        };
+        static nf_buffers buffers[GGML_SYCL_MAX_DEVICES];
+        int device = -1;
+        for (int d = 0; d < ggml_sycl_info().device_count; ++d) {
+            if (stream->get_device() == dpct::get_device(d)) { device = d; break; }
+        }
+        GGML_ASSERT(device >= 0);
+        auto & b = buffers[device];
+        auto & nf_f = b.f; auto & nf_fcap = b.fcap;
+        auto & nf_8 = b.w8; auto & nf_8cap = b.cap8;
+        auto & nf_w = b.w4; auto & nf_wcap = b.cap4;
         const size_t fb = tbytes * sizeof(float);
         const size_t wb = wbytes + scb;
         const bool nf_fast = g == K && xe2mx_s44_hs() == 128 && (K % 128) == 0 && !ggml_sycl_get_env("GGML_SYCL_XE2MX_NF_SLOW", 0);
@@ -4287,7 +4314,7 @@ static bool xe2mx_s44_cached(queue_ptr stream, const uint8_t * packed, int64_t K
                 ggml_sycl_free_device(t1, *stream); ggml_sycl_free_device(f1, *stream); ggml_sycl_free_device(s1, *stream);
             }
             if (g == K && xe2mx_s44_hs() == 128 && (K % 128) == 0 && !ggml_sycl_get_env("GGML_SYCL_XE2MX_NF_SLOW", 0)) {
-                static std::unordered_map<const void *, float *> nf_sc;
+                auto & nf_sc = b.scales;
                 auto sit = nf_sc.find((const void *) packed);
                 if (sit != nf_sc.end() && !ggml_sycl_get_env("GGML_SYCL_XE2MX_NF_NOSC", 0)) {
                     stream->memcpy(sc, sit->second, (size_t) N * sizeof(float));
@@ -4555,18 +4582,15 @@ static int xe2mx_s44_nslot(void) {
 }
 
 static int xe2mx_s44_slot_find(const void * asrc, const sycl::half * xh, const float * xf, int64_t M, int64_t K,
-                               int s8ra, int qmode, size_t an4, size_t sa_need, size_t za_need) {
+                               int s8ra, int qmode, size_t an4, size_t sa_need, size_t za_need, int dev_id) {
     if (!asrc) {
         return -1;
     }
-    // Slots are sliced per device: the array is process-global, and a dual-GPU
-    // run must never hand card0's packed buffers to card1 (cross-device USM in
-    // kernel args -> L0 execute fails with UR 39 OUT_OF_DEVICE_MEMORY).
+    const int dev = dev_id;
     const int n = xe2mx_s44_nslot();
-    const int base = ggml_sycl_get_device() * n;
-    for (int i = base; i < base + n; i++) {
+    for (int i = 0; i < n; i++) {
         xe2mx_s44_aslot & s = g_xe2mx_s44_slot[i];
-        if (!s.a4 || !s.sa || s.src != asrc) {
+        if (!s.a4 || !s.sa || s.src != asrc || s.dev != dev) {
             continue;
         }
         if (s.M != M || s.K != K || s.qmode != qmode || s.sa_row != s8ra) {
@@ -4592,10 +4616,9 @@ static int xe2mx_s44_slot_find(const void * asrc, const sycl::half * xh, const f
 
 static int xe2mx_s44_slot_victim(void) {
     const int n = xe2mx_s44_nslot();
-    const int base = ggml_sycl_get_device() * n;
-    int v = base;
-    uint64_t best = g_xe2mx_s44_slot[base].tick;
-    for (int i = base; i < base + n; i++) {
+    int v = 0;
+    uint64_t best = g_xe2mx_s44_slot[0].tick;
+    for (int i = 0; i < n; i++) {
         if (!g_xe2mx_s44_slot[i].a4) {
             return i;
         }
@@ -4651,12 +4674,13 @@ static int xe2mx_s44_pack_slot_xf(queue_ptr stream, const void * asrc, const flo
         s44_pack_a && s44pn, s44hrow, s44hocc, s44hwide, s44hilp);
     const size_t an4 = (size_t) M * (size_t) (K / 2);
     const size_t sa_need = (size_t) M * (size_t) (K / s44g) * sizeof(float);
-    if (xe2mx_s44_slot_find(asrc, nullptr, xf, M, K, s8ra, qmode, an4, sa_need, 0) >= 0) {
+    const int dev_id = xe2mx_q_dev(*stream);
+    if (xe2mx_s44_slot_find(asrc, nullptr, xf, M, K, s8ra, qmode, an4, sa_need, 0, dev_id) >= 0) {
         return 1;
     }
     const int vi = xe2mx_s44_slot_victim();
     xe2mx_s44_aslot & vs = g_xe2mx_s44_slot[vi];
-    if (vs.a4_cap < an4) {
+    if (vs.a4_cap < an4 || vs.dev != dev_id) {
         void * p = ggml_sycl_malloc_device(an4, *stream);
         if (!p) {
             return 0;
@@ -4664,7 +4688,7 @@ static int xe2mx_s44_pack_slot_xf(queue_ptr stream, const void * asrc, const flo
         vs.a4 = (uint8_t *) p;
         vs.a4_cap = an4;
     }
-    if (vs.sa_cap < sa_need) {
+    if (vs.sa_cap < sa_need || vs.dev != dev_id) {
         void * p = ggml_sycl_malloc_device(sa_need, *stream);
         if (!p) {
             return 0;
@@ -4672,6 +4696,7 @@ static int xe2mx_s44_pack_slot_xf(queue_ptr stream, const void * asrc, const flo
         vs.sa = (float *) p;
         vs.sa_cap = sa_need;
     }
+    vs.dev = dev_id;
     if (!xe2mx_quant_a_s4_nibble_had_f32_rte(stream, xf, vs.a4, vs.sa, M, K, (int64_t) s44g)) {
         return 0;
     }
@@ -4733,12 +4758,13 @@ bool ggml_sycl_xe2mx_s44_rms_hilp(queue_ptr stream, const void * asrc, const flo
         s44from >= 0 && s44pn, 0, 0, 0, s44hilp);
     const size_t an4 = (size_t) M * (size_t) (K / 2);
     const size_t sa_need = (size_t) M * (size_t) (K / s44g) * sizeof(float);
-    if (xe2mx_s44_slot_find(asrc, nullptr, y, M, K, 0, qmode, an4, sa_need, 0) >= 0) {
+    const int dev_id = xe2mx_q_dev(*stream);
+    if (xe2mx_s44_slot_find(asrc, nullptr, y, M, K, 0, qmode, an4, sa_need, 0, dev_id) >= 0) {
         return false;
     }
     const int vi = xe2mx_s44_slot_victim();
     xe2mx_s44_aslot & vs = g_xe2mx_s44_slot[vi];
-    if (vs.a4_cap < an4) {
+    if (vs.a4_cap < an4 || vs.dev != dev_id) {
         void * p = ggml_sycl_malloc_device(an4, *stream);
         if (!p) {
             return false;
@@ -4746,7 +4772,7 @@ bool ggml_sycl_xe2mx_s44_rms_hilp(queue_ptr stream, const void * asrc, const flo
         vs.a4 = (uint8_t *) p;
         vs.a4_cap = an4;
     }
-    if (vs.sa_cap < sa_need) {
+    if (vs.sa_cap < sa_need || vs.dev != dev_id) {
         void * p = ggml_sycl_malloc_device(sa_need, *stream);
         if (!p) {
             return false;
@@ -4754,6 +4780,7 @@ bool ggml_sycl_xe2mx_s44_rms_hilp(queue_ptr stream, const void * asrc, const flo
         vs.sa = (float *) p;
         vs.sa_cap = sa_need;
     }
+    vs.dev = dev_id;
     if (!xe2mx_rms_mul_hilp_pack(stream, x, mul, y, vs.a4, vs.sa, M, K, (int64_t) s44g, eps)) {
         return false;
     }
@@ -4813,12 +4840,13 @@ bool ggml_sycl_xe2mx_s44_add_rms_hilp(queue_ptr stream, const void * asrc, const
         s44from >= 0 && s44pn, 0, 0, 0, s44hilp);
     const size_t an4 = (size_t) M * (size_t) (K / 2);
     const size_t sa_need = (size_t) M * (size_t) (K / s44g) * sizeof(float);
-    if (xe2mx_s44_slot_find(asrc, nullptr, y, M, K, 0, qmode, an4, sa_need, 0) >= 0) {
+    const int dev_id = xe2mx_q_dev(*stream);
+    if (xe2mx_s44_slot_find(asrc, nullptr, y, M, K, 0, qmode, an4, sa_need, 0, dev_id) >= 0) {
         return true;
     }
     const int vi = xe2mx_s44_slot_victim();
     xe2mx_s44_aslot & vs = g_xe2mx_s44_slot[vi];
-    if (vs.a4_cap < an4) {
+    if (vs.a4_cap < an4 || vs.dev != dev_id) {
         void * p = ggml_sycl_malloc_device(an4, *stream);
         if (!p) {
             return false;
@@ -4826,7 +4854,7 @@ bool ggml_sycl_xe2mx_s44_add_rms_hilp(queue_ptr stream, const void * asrc, const
         vs.a4 = (uint8_t *) p;
         vs.a4_cap = an4;
     }
-    if (vs.sa_cap < sa_need) {
+    if (vs.sa_cap < sa_need || vs.dev != dev_id) {
         void * p = ggml_sycl_malloc_device(sa_need, *stream);
         if (!p) {
             return false;
@@ -4834,6 +4862,7 @@ bool ggml_sycl_xe2mx_s44_add_rms_hilp(queue_ptr stream, const void * asrc, const
         vs.sa = (float *) p;
         vs.sa_cap = sa_need;
     }
+    vs.dev = dev_id;
     if (!xe2mx_add_rms_mul_hilp_pack(stream, a, b, add_dst, mul, y, vs.a4, vs.sa, M, K, (int64_t) s44g, eps, drop_add)) {
         return false;
     }
@@ -4901,12 +4930,13 @@ bool ggml_sycl_xe2mx_s44_add_rms_bufs(queue_ptr stream, const void * asrc, const
         s44from >= 0 && s44pn, 0, 0, 0, s44hilp);
     const size_t an4 = (size_t) M * (size_t) (K / 2);
     const size_t sa_need = (size_t) M * (size_t) (K / s44g) * sizeof(float);
-    if (xe2mx_s44_slot_find(asrc, nullptr, y, M, K, 0, qmode, an4, sa_need, 0) >= 0) {
+    const int dev_id = xe2mx_q_dev(*stream);
+    if (xe2mx_s44_slot_find(asrc, nullptr, y, M, K, 0, qmode, an4, sa_need, 0, dev_id) >= 0) {
         return false;
     }
     const int vi = xe2mx_s44_slot_victim();
     xe2mx_s44_aslot & vs = g_xe2mx_s44_slot[vi];
-    if (vs.a4_cap < an4) {
+    if (vs.a4_cap < an4 || vs.dev != dev_id) {
         void * p = ggml_sycl_malloc_device(an4, *stream);
         if (!p) {
             return false;
@@ -4914,7 +4944,7 @@ bool ggml_sycl_xe2mx_s44_add_rms_bufs(queue_ptr stream, const void * asrc, const
         vs.a4 = (uint8_t *) p;
         vs.a4_cap = an4;
     }
-    if (vs.sa_cap < sa_need) {
+    if (vs.sa_cap < sa_need || vs.dev != dev_id) {
         void * p = ggml_sycl_malloc_device(sa_need, *stream);
         if (!p) {
             return false;
@@ -4922,6 +4952,7 @@ bool ggml_sycl_xe2mx_s44_add_rms_bufs(queue_ptr stream, const void * asrc, const
         vs.sa = (float *) p;
         vs.sa_cap = sa_need;
     }
+    vs.dev = dev_id;
     vs.xh = nullptr;
     vs.xf = y;
     vs.src = asrc;
@@ -4987,12 +5018,13 @@ bool ggml_sycl_xe2mx_s44_silu_hilp(queue_ptr stream, const void * asrc, const fl
         s44from >= 0 && s44pn, 0, 0, 0, s44hilp);
     const size_t an4 = (size_t) M * (size_t) (K / 2);
     const size_t sa_need = (size_t) M * (size_t) (K / s44g) * sizeof(float);
-    if (xe2mx_s44_slot_find(asrc, nullptr, y, M, K, 0, qmode, an4, sa_need, 0) >= 0) {
+    const int dev_id = xe2mx_q_dev(*stream);
+    if (xe2mx_s44_slot_find(asrc, nullptr, y, M, K, 0, qmode, an4, sa_need, 0, dev_id) >= 0) {
         return true;
     }
     const int vi = xe2mx_s44_slot_victim();
     xe2mx_s44_aslot & vs = g_xe2mx_s44_slot[vi];
-    if (vs.a4_cap < an4) {
+    if (vs.a4_cap < an4 || vs.dev != dev_id) {
         void * p = ggml_sycl_malloc_device(an4, *stream);
         if (!p) {
             return false;
@@ -5000,7 +5032,7 @@ bool ggml_sycl_xe2mx_s44_silu_hilp(queue_ptr stream, const void * asrc, const fl
         vs.a4 = (uint8_t *) p;
         vs.a4_cap = an4;
     }
-    if (vs.sa_cap < sa_need) {
+    if (vs.sa_cap < sa_need || vs.dev != dev_id) {
         void * p = ggml_sycl_malloc_device(sa_need, *stream);
         if (!p) {
             return false;
@@ -5008,6 +5040,7 @@ bool ggml_sycl_xe2mx_s44_silu_hilp(queue_ptr stream, const void * asrc, const fl
         vs.sa = (float *) p;
         vs.sa_cap = sa_need;
     }
+    vs.dev = dev_id;
     if (!xe2mx_silu_up_hilp_pack(stream, gate, up, y, vs.a4, vs.sa, M, K, (int64_t) s44g)) {
         return false;
     }
@@ -5550,12 +5583,12 @@ static bool xe2mx_p0_u4(ggml_backend_sycl_context & ctx, const uint8_t * packed,
         }
     }
     const int s44from = ggml_sycl_get_env("GGML_SYCL_XE2MX_S44FROM", -1);
-    const int s44to = ggml_sycl_get_env("GGML_SYCL_XE2MX_S44TO", 64);
+    const int s44to = ggml_sycl_get_env("GGML_SYCL_XE2MX_S44TO", 256);
     const int s44ffnfrom = ggml_sycl_get_env("GGML_SYCL_XE2MX_S44FFNFROM", -1);
     const int s44skip = ggml_sycl_get_env("GGML_SYCL_XE2MX_S44SKIP", -1);
     const int s44skip2 = ggml_sycl_get_env("GGML_SYCL_XE2MX_S44SKIP2", -1);
-    int s44_pack_a = s44from >= 0 && s44layer >= s44from && s44layer < s44to && s44layer < 64;
-    if (!s44_pack_a && s44ffnfrom >= 0 && s44layer >= s44ffnfrom && s44layer < 64
+    int s44_pack_a = s44from >= 0 && s44layer >= s44from && s44layer < s44to;
+    if (!s44_pack_a && s44ffnfrom >= 0 && s44layer >= s44ffnfrom && s44layer < s44to
         && (N >= 16384 || K >= 16384)) {
         s44_pack_a = 1;
     }
@@ -5600,7 +5633,8 @@ static bool xe2mx_p0_u4(ggml_backend_sycl_context & ctx, const uint8_t * packed,
     const int s44rms = ggml_sycl_get_env("GGML_SYCL_XE2MX_S44RMS", 0);
     const int s44qmode = xe2mx_s44_qmode(s8ra, s44h, s44zp, s44g, s44clip, s44adiv, s44arow, s44rms,
         s44_pack_a && s44pn, s44hrow, s44hocc, s44hwide, s44hilp);
-    int s440 = !s8g && !s8u4_env && !g_xe2mx_s44_dead && (xh != nullptr || ((lo_w || xe2mx_nf_xf_on(K, N)) && xf))
+    int s440 = !s8g && !s8u4_env && !g_xe2mx_s44_dead
+        && (xh != nullptr || ((lo_w || (xe2mx_nf_xf_on(K, N) && s44_pack_a)) && xf))
         && (M >= 32 || lo_w) && (K % s44g) == 0
         && (s44dn || (ggml_sycl_get_env("GGML_SYCL_XE2MX_S44", 0)
             && N >= ggml_sycl_get_env("GGML_SYCL_XE2MX_S44N", 10240))
@@ -5652,7 +5686,7 @@ static bool xe2mx_p0_u4(ggml_backend_sycl_context & ctx, const uint8_t * packed,
     if (s4glu && (s8g || s4f32 || s4s || f16d || fadd)) {
         return false;
     }
-    if (!s8g && !s4f32 && xh == nullptr && !((lo_w || xe2mx_nf_xf_on(K, N)) && xf)) {
+    if (!s8g && !s4f32 && xh == nullptr && !((lo_w || (xe2mx_nf_xf_on(K, N) && s44_pack_a)) && xf)) {
         return false;
     }
     if (s8g && xh == nullptr && xf == nullptr) {
@@ -6003,7 +6037,7 @@ static bool xe2mx_p0_u4(ggml_backend_sycl_context & ctx, const uint8_t * packed,
         if ((acache || astick) && asrc) {
             const ggml_tensor * at = (const ggml_tensor *) asrc;
             char buf[320];
-            std::snprintf(buf, sizeof(buf), "%s/%ld/%ld/%d", at->name, (long) M, (long) K, s44qmode);
+            std::snprintf(buf, sizeof(buf), "%d/%s/%ld/%ld/%d", ctx.device, at->name, (long) M, (long) K, s44qmode);
             akey.assign(buf);
         }
         if (asrc) {
@@ -6026,7 +6060,7 @@ static bool xe2mx_p0_u4(ggml_backend_sycl_context & ctx, const uint8_t * packed,
             g_xe2mx_s44_pack_hit++;
             g_xe2mx_s44_pack_n++;
         } else {
-            const int hit = xe2mx_s44_slot_find(asrc, xh, xf, M, K, s8ra, s44qmode, apack, sa_need, za_need);
+            const int hit = xe2mx_s44_slot_find(asrc, xh, xf, M, K, s8ra, s44qmode, apack, sa_need, za_need, ctx.device);
             if (hit >= 0) {
                 xe2mx_s44_aslot & hs = g_xe2mx_s44_slot[hit];
                 Ap = (int8_t *) hs.a4;
@@ -7157,7 +7191,7 @@ static bool xe2mx_p0_u4(ggml_backend_sycl_context & ctx, const uint8_t * packed,
                     GGML_SYCL_XE2_LOG(
                             "xe2mx s4args dev=%d sycldev=%d n=%d M=%ld N=%ld K=%ld "
                             "A=%p/%d B=%p/%d C=%p/%d SC=%p/%d SA=%p/%d SP=%p/%d "
-                            "loa=%p s8ra=%p ar=%p xh=%p name=%s\n",
+                            "loa=%p s8ra=%p ar=%p xh=%p RES=%p/%d GLU=%p/%d name=%s\n",
                             d, ggml_sycl_get_device(), narg[d],
                             (long) M, (long) N, (long) K,
                             aptr, onq(aptr), bptr, onq(bptr), cptr, onq(cptr),
@@ -7165,6 +7199,7 @@ static bool xe2mx_p0_u4(ggml_backend_sycl_context & ctx, const uint8_t * packed,
                             sp_mem.get_data_handle(), onq(sp_mem.get_data_handle()),
                             (void *) g_xe2mx_loa, (void *) g_xe2mx_s8ra,
                             (void *) g_xe2mx_ar_buf, (void *) g_xe2mx_xh_buf,
+                            (void *) residual, onq(residual), (void *) glu_up, onq(glu_up),
                             (wt && wt->name) ? wt->name : "?");
                     fflush(stderr);
                 }
@@ -8814,7 +8849,7 @@ static bool xe2mx_lo_pack_act(ggml_backend_sycl_context & ctx, const ggml_tensor
     const sycl::half * xh = nullptr;
     if (act->type == GGML_TYPE_F16) {
         xh = (const sycl::half *) act->data;
-    } else if (g_xe2mx_xh_buf && g_xe2mx_xh_src == act && g_xe2mx_xh_M == M && g_xe2mx_xh_K == K
+    } else if (g_xe2mx_xh_buf && g_xe2mx_xh_dev == ctx.device && g_xe2mx_xh_src == act && g_xe2mx_xh_M == M && g_xe2mx_xh_K == K
                && g_xe2mx_xh_hit_epoch == g_xe2mx_xh_epoch) {
         xh = g_xe2mx_xh_buf;
     } else {
@@ -8823,11 +8858,12 @@ static bool xe2mx_lo_pack_act(ggml_backend_sycl_context & ctx, const ggml_tensor
             return false;
         }
         const size_t need = (size_t) M * (size_t) K * sizeof(sycl::half);
-        if (g_xe2mx_xh_cap < need) {
+        if (g_xe2mx_xh_cap < need || g_xe2mx_xh_dev != ctx.device) {
             void * p = ggml_sycl_malloc_device(need, *stream);
             if (p) {
                 g_xe2mx_xh_buf = (sycl::half *) p;
                 g_xe2mx_xh_cap = need;
+                g_xe2mx_xh_dev = ctx.device;
             }
         }
         if (!g_xe2mx_xh_buf || g_xe2mx_xh_cap < need) {
@@ -12521,6 +12557,7 @@ struct xe2mx_devscratch {
     const ggml_tensor * xh_src;
     sycl::half * xh_buf;
     size_t xh_cap;
+    int xh_dev = -1;
     int64_t xh_M, xh_K;
     uint64_t xh_epoch, xh_hit_epoch;
     const ggml_tensor * aq_src;
@@ -12532,6 +12569,7 @@ struct xe2mx_devscratch {
     const sycl::half * ar_xh;
     uint8_t * ar_buf;
     size_t ar_cap, ar_bytes;
+    int ar_dev = -1;
     int64_t ar_M, ar_K;
     uint64_t ar_hit_epoch;
     uint8_t * loa;
@@ -12617,12 +12655,12 @@ static void xe2mx_scratch_save(xe2mx_devscratch & s) {
     s.s4dn_g = g_xe2mx_s4dn_g; s.s4dn_t8 = g_xe2mx_s4dn_t8; s.s4dn_t8_cap = g_xe2mx_s4dn_t8_cap;
     s.s4dn_psrc = g_xe2mx_s4dn_psrc; s.s4dn_psrc_cap = g_xe2mx_s4dn_psrc_cap;
     s.s44_b8 = g_xe2mx_s44_b8; s.s44_b8_cap = g_xe2mx_s44_b8_cap;
-    s.xh_src = g_xe2mx_xh_src; s.xh_buf = g_xe2mx_xh_buf; s.xh_cap = g_xe2mx_xh_cap;
+    s.xh_src = g_xe2mx_xh_src; s.xh_buf = g_xe2mx_xh_buf; s.xh_cap = g_xe2mx_xh_cap; s.xh_dev = g_xe2mx_xh_dev;
     s.xh_M = g_xe2mx_xh_M; s.xh_K = g_xe2mx_xh_K; s.xh_epoch = g_xe2mx_xh_epoch; s.xh_hit_epoch = g_xe2mx_xh_hit_epoch;
     s.aq_src = g_xe2mx_aq_src; s.aq_buf = g_xe2mx_aq_buf; s.daq_buf = g_xe2mx_daq_buf;
     s.aq_cap = g_xe2mx_aq_cap; s.daq_cap = g_xe2mx_daq_cap;
     s.aq_M = g_xe2mx_aq_M; s.aq_K = g_xe2mx_aq_K; s.aq_hit_epoch = g_xe2mx_aq_hit_epoch;
-    s.ar_xh = g_xe2mx_ar_xh; s.ar_buf = g_xe2mx_ar_buf; s.ar_cap = g_xe2mx_ar_cap; s.ar_bytes = g_xe2mx_ar_bytes;
+    s.ar_xh = g_xe2mx_ar_xh; s.ar_buf = g_xe2mx_ar_buf; s.ar_cap = g_xe2mx_ar_cap; s.ar_bytes = g_xe2mx_ar_bytes; s.ar_dev = g_xe2mx_ar_dev;
     s.ar_M = g_xe2mx_ar_M; s.ar_K = g_xe2mx_ar_K; s.ar_hit_epoch = g_xe2mx_ar_hit_epoch;
     s.loa = g_xe2mx_loa; s.losa = g_xe2mx_losa; s.loa_src = g_xe2mx_loa_src; s.loa_xh = g_xe2mx_loa_xh;
     s.loa_cap = g_xe2mx_loa_cap; s.losa_cap = g_xe2mx_losa_cap;
@@ -12681,12 +12719,12 @@ static void xe2mx_scratch_load(const xe2mx_devscratch & s) {
     g_xe2mx_s4dn_g = s.s4dn_g; g_xe2mx_s4dn_t8 = s.s4dn_t8; g_xe2mx_s4dn_t8_cap = s.s4dn_t8_cap;
     g_xe2mx_s4dn_psrc = s.s4dn_psrc; g_xe2mx_s4dn_psrc_cap = s.s4dn_psrc_cap;
     g_xe2mx_s44_b8 = s.s44_b8; g_xe2mx_s44_b8_cap = s.s44_b8_cap;
-    g_xe2mx_xh_src = s.xh_src; g_xe2mx_xh_buf = s.xh_buf; g_xe2mx_xh_cap = s.xh_cap;
+    g_xe2mx_xh_src = s.xh_src; g_xe2mx_xh_buf = s.xh_buf; g_xe2mx_xh_cap = s.xh_cap; g_xe2mx_xh_dev = s.xh_dev;
     g_xe2mx_xh_M = s.xh_M; g_xe2mx_xh_K = s.xh_K; g_xe2mx_xh_epoch = s.xh_epoch; g_xe2mx_xh_hit_epoch = s.xh_hit_epoch;
     g_xe2mx_aq_src = s.aq_src; g_xe2mx_aq_buf = s.aq_buf; g_xe2mx_daq_buf = s.daq_buf;
     g_xe2mx_aq_cap = s.aq_cap; g_xe2mx_daq_cap = s.daq_cap;
     g_xe2mx_aq_M = s.aq_M; g_xe2mx_aq_K = s.aq_K; g_xe2mx_aq_hit_epoch = s.aq_hit_epoch;
-    g_xe2mx_ar_xh = s.ar_xh; g_xe2mx_ar_buf = s.ar_buf; g_xe2mx_ar_cap = s.ar_cap; g_xe2mx_ar_bytes = s.ar_bytes;
+    g_xe2mx_ar_xh = s.ar_xh; g_xe2mx_ar_buf = s.ar_buf; g_xe2mx_ar_cap = s.ar_cap; g_xe2mx_ar_bytes = s.ar_bytes; g_xe2mx_ar_dev = s.ar_dev;
     g_xe2mx_ar_M = s.ar_M; g_xe2mx_ar_K = s.ar_K; g_xe2mx_ar_hit_epoch = s.ar_hit_epoch;
     g_xe2mx_loa = s.loa; g_xe2mx_losa = s.losa; g_xe2mx_loa_src = s.loa_src; g_xe2mx_loa_xh = s.loa_xh;
     g_xe2mx_loa_cap = s.loa_cap; g_xe2mx_losa_cap = s.losa_cap;
@@ -12715,8 +12753,8 @@ static void xe2mx_scratch_load(const xe2mx_devscratch & s) {
     g_xe2mx_gmlp_ho = s.gmlp_ho; g_xe2mx_gmlp_ho_cap = s.gmlp_ho_cap;
 }
 
-void xe2mx_scratch_bind(int device) {
-    if (device == g_xe2mx_scratch_dev) {
+void xe2mx_scratch_bind(int device, bool force) {
+    if (device == g_xe2mx_scratch_dev && !force) {
         return;
     }
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {

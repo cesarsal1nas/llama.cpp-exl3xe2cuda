@@ -92,6 +92,12 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
+// The caller drains the old target before retargeting. Shared-memory drafts are rejected.
+bool common_speculative_retarget(common_speculative * spec, llama_context * ctx_tgt);
+
+// Seed the single-sequence MTP hidden row at a phase boundary; draft KV is unchanged.
+bool common_speculative_seed_pending(common_speculative * spec, const float * row, size_t n_embd);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
@@ -111,6 +117,7 @@ struct common_speculative_init_result {
 
     llama_model   * model();
     llama_context * context();
+    llama_context * context_mtp();
 
 private:
     struct impl;

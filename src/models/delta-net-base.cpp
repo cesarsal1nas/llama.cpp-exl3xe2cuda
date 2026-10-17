@@ -499,9 +499,14 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
         //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
 
-        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+        // prefill-sized chunks keep llama_rs_prefill_k slots, not the full rollback depth (K=8 views
+        // on a 3072-token conv were the leftover long-PP cost after the ubatch tail cut)
+        const int64_t n_tok_c = conv_input->ne[0] - conv_states->ne[0];
+        const int64_t K = n_tok_c > 64 ? llama_rs_prefill_k((int64_t) cparams.n_rs_seq + 1)
+                                       : (int64_t) cparams.n_rs_seq + 1;
+        const int64_t n_wr_c  = llama_rs_snapshots_written(n_tok_c, (int64_t) cparams.n_rs_seq + 1);
 
-        for (int64_t t = 1; t <= K; ++t) {
+        for (int64_t t = K - n_wr_c + 1; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
             const int64_t s_slot = K - t;
 
@@ -561,7 +566,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     }
 
     const int64_t D = S_v * S_v * H_v;
-    const int64_t K = cparams.n_rs_seq + 1;
+    const int64_t K = n_seq_tokens > 64 ? llama_rs_prefill_k((int64_t) cparams.n_rs_seq + 1)
+                                        : (int64_t) cparams.n_rs_seq + 1;
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);

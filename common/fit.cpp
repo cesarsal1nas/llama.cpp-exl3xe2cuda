@@ -1082,3 +1082,55 @@ void common_fit_print(
     printf("%zu ", dmd.back().mb.compute/1024/1024);
     printf("\n");
 }
+
+bool common_memory_overcommit_check(const std::vector<const llama_context *> & ctxs) {
+    if (ctxs.empty() || ctxs[0] == nullptr) {
+        return true;
+    }
+    const llama_model * model = llama_get_model(ctxs[0]);
+    std::vector<ggml_backend_dev_t> devices;
+    for (int i = 0; i < llama_model_n_devices(model); i++) {
+        devices.push_back(llama_model_get_device(model, i));
+    }
+    std::vector<size_t> self(devices.size(), 0);
+    for (const llama_context * ctx : ctxs) {
+        if (ctx == nullptr) {
+            continue;
+        }
+        for (const auto & buft_mb : llama_get_memory_breakdown(ctx)) {
+            ggml_backend_buffer_type_t buft = buft_mb.first;
+            if (ggml_backend_buft_is_host(buft)) {
+                continue;
+            }
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            for (size_t i = 0; i < devices.size(); i++) {
+                if (devices[i] == dev) {
+                    self[i] += buft_mb.second.model + buft_mb.second.context + buft_mb.second.compute;
+                }
+            }
+        }
+    }
+    constexpr int64_t MiB = 1024 * 1024;
+    // driver, kernel binaries and library scratch live outside these buffers (measured ~2-3 GiB on Arc B65)
+    constexpr int64_t warn_headroom = 3 * 1024 * MiB;
+    bool ok = true;
+    for (size_t i = 0; i < devices.size(); i++) {
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(devices[i], &free, &total);
+        if (total == 0) {
+            continue;
+        }
+        const int64_t headroom = (int64_t) total - (int64_t) self[i];
+        if (headroom < 0) {
+            LOG_ERR("%s: %s needs %" PRId64 " MiB of buffers but has %" PRId64 " MiB total; reduce -ub/-b, "
+                    "context size, or rebalance --tensor-split/draft device\n", __func__, ggml_backend_dev_name(devices[i]),
+                    (int64_t) self[i] / MiB, (int64_t) total / MiB);
+            ok = false;
+        } else if (headroom < warn_headroom) {
+            LOG_WRN("%s: %s has only %" PRId64 " MiB left for driver and library scratch after %" PRId64
+                    " MiB of buffers; it may spill to system memory and slow down sharply\n", __func__,
+                    ggml_backend_dev_name(devices[i]), headroom / MiB, (int64_t) self[i] / MiB);
+        }
+    }
+    return ok;
+}

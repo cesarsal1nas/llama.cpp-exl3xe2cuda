@@ -1742,6 +1742,37 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 }
 
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    // Causal-contiguous valid KV length for backends that build an implicit causal mask (oneDNN SDPA):
+    // L > 0 only when one stream, one sequence, causal, no SWA, contiguous ubatch positions p..p+n-1, and
+    // cells [0, L) hold exactly positions 0..L-1 of that sequence with [L, n_kv) empty. Then the mask is
+    // "col <= row + L - n" and any backend may use it instead of the dense mask. Otherwise 0 (use the mask).
+    {
+        int32_t L = 0;
+        const int64_t n_kv_mask = dst->ne[0];
+        if (causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && dst->ne[3] == 1 && n_stream == 1 && ubatch->n_tokens > 0) {
+            const uint32_t n = ubatch->n_tokens;
+            const llama_seq_id s0 = ubatch->seq_id[0][0];
+            bool ok = true;
+            for (uint32_t i = 0; i < n && ok; ++i) {
+                ok = ubatch->n_seq_id[i] == 1 && ubatch->seq_id[i][0] == s0 && ubatch->pos[i] == ubatch->pos[0] + (llama_pos) i;
+            }
+            const int64_t want = (int64_t) ubatch->pos[0] + n;
+            ok = ok && ubatch->pos[0] >= 0 && want <= n_kv_mask;
+            const auto & cells = v_cells[0];
+            for (int64_t j = 0; j < n_kv_mask && ok; ++j) {
+                if (j < want) {
+                    ok = !cells.is_empty((uint32_t) j) && cells.pos_get((uint32_t) j) == (llama_pos) j && cells.seq_has((uint32_t) j, s0)
+                         && cells.seq_count((uint32_t) j) == 1;
+                } else {
+                    ok = cells.is_empty((uint32_t) j);
+                }
+            }
+            if (ok) {
+                L = (int32_t) want;
+            }
+        }
+        dst->op_params[0] = L;
+    }
     // Causal graph builds its own mask (GenIndex), so the dense host mask is dead work:
     // ~512 MB of f16 writes per 128k x 2048 chunk. Skip behind an env so it can be measured
     // and reverted without a rebuild. Non-causal and SWA caches still need the mask.

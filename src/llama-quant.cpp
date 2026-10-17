@@ -1105,7 +1105,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             metadata[i].target_type = tensor->type;
         }
 
-        metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
+        metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype)
+                                       && metadata[i].target_type != tensor->type; // same type = byte copy, nothing to calibrate
 
         if (params->imatrix) {
             metadata[i].remapped_imatrix_name = remap_imatrix(tensor->name, mapped);
@@ -1302,7 +1303,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const bool xe2mx_gpu = new_type == GGML_TYPE_XE2MX4 &&
                     (xe2mx_src_raw || ggml_is_quantized(tensor->type)) &&
                     (n_per_row % ggml_blck_size(GGML_TYPE_XE2MX4) == 0) &&
-                    tensor->ne[2] == 1 && tensor->ne[3] == 1;
+                    // 3D expert stacks are independent rows; only the per-expert imatrix slice needs 2D
+                    ((tensor->ne[2] == 1 && tensor->ne[3] == 1) || imatrix == nullptr);
                 const bool xe2mx_gpu_deq = xe2mx_gpu && !xe2mx_src_raw;
 #else
                 const bool xe2mx_gpu = false;

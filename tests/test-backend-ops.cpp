@@ -1348,7 +1348,7 @@ struct test_case {
         mode = MODE_TEST;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
+            /* .mem_size = */ ggml_tensor_overhead()*256 + ggml_graph_overhead(),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -1539,7 +1539,7 @@ struct test_case {
         static const size_t graph_nodes = 8192;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_size = */ ggml_tensor_overhead()*256 + ggml_graph_overhead_custom(graph_nodes, false),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -1686,7 +1686,7 @@ struct test_case {
         static const size_t graph_nodes = 8192;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_size = */ ggml_tensor_overhead()*256 + ggml_graph_overhead_custom(graph_nodes, false),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -1720,7 +1720,7 @@ struct test_case {
         const std::vector<float> expect = grad_expect();
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + 2*ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true),
+            /* .mem_size = */ ggml_tensor_overhead()*256 + 2*ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -3636,6 +3636,62 @@ struct test_rms_norm_back : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_MUL with a per-group weight (Mamba-2 grouped norm shape)
+struct test_rms_norm_mul_rows : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int64_t w_rows;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_ROWS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, w_rows);
+    }
+
+    test_rms_norm_mul_rows(std::array<int64_t, 4> ne = {1024, 8, 40, 1}, int64_t w_rows = 8)
+        : ne(ne), w_rows(w_rows) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], w_rows);
+        ggml_set_name(x, "x");
+        ggml_set_name(w, "w");
+        ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-5f), w);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_bolt_tail : public test_case {
+    int64_t tokens;
+    bool strided;
+    test_bolt_tail(int64_t tokens, bool strided) : tokens(tokens), strided(strided) {}
+    std::string op_desc(ggml_tensor *) override { return "BOLT_TAIL"; }
+    std::string vars() override { return VARS_TO_STR2(tokens, strided); }
+    bool run_whole_graph() override { return true; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * zin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided ? 18560 : 8192, tokens);
+        auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 128, tokens);
+        if (strided) { x->nb[2] = 10240 * sizeof(float); x->nb[3] = x->nb[2] * tokens; }
+        auto * scan = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8192 * tokens + 4096);
+        auto * d = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 128);
+        auto * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 8);
+        auto * z = ggml_view_3d(ctx, zin, 64, 128, tokens, 256, zin->nb[1], strided ? 64 : 0);
+        auto * c = ggml_cont(ctx, z);
+        auto * s = ggml_view_3d(ctx, scan, 64, 128, tokens, 256, 32768, 0);
+        auto * y = ggml_add(ctx, s, ggml_mul(ctx, x, d));
+        auto * gate = ggml_swiglu_split(ctx, c, y);
+        auto * grouped = ggml_reshape_3d(ctx, gate, 1024, 8, tokens);
+        auto * out = ggml_mul(ctx, ggml_rms_norm(ctx, grouped, 1e-5f), w);
+        ggml_set_name(out, "bolt_tail_out");
+        return out;
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
@@ -4284,6 +4340,10 @@ struct test_ssm_scan : public test_case {
 
     double max_nmse_err() override {
         // SSD path (head_dim > 1) uses FP16 intermediates (M matrix, X_dt); Mamba-1 is pure FP32.
+        // FP16 error accumulates with chunk count (2053 tokens: ~2.05e-7 at K=1 and K=9 alike).
+        if (head_dim > 1 && n_seq_tokens > 1024) {
+            return 4e-7;
+        }
         return (head_dim > 1) ? 2e-7 : 1e-7;
     }
 
@@ -4404,6 +4464,7 @@ struct test_ssm_scan_rollback : public test_case {
         const int64_t state_elems = d_state  * head_dim * n_head      * n_seqs;
 
         ggml_tensor * out = nullptr;
+        ggml_tensor * energy = nullptr;
         for (int64_t slot = 0; slot < K; ++slot) {
             const int64_t prefix_tokens = n_seq_tokens - slot;
 
@@ -4417,11 +4478,15 @@ struct test_ssm_scan_rollback : public test_case {
             ggml_tensor * full_state   = ggml_view_1d(ctx, full,   state_elems, (y_elems + slot*state_elems)*ggml_element_size(full));
             ggml_tensor * prefix_state = ggml_view_1d(ctx, prefix, state_elems, (head_dim*n_head*prefix_tokens*n_seqs)*ggml_element_size(prefix));
             ggml_tensor * diff         = ggml_sum(ctx, ggml_sqr(ctx, ggml_sub(ctx, full_state, prefix_state)));
+            ggml_tensor * ref          = ggml_sum(ctx, ggml_sqr(ctx, prefix_state));
 
-            out = out == nullptr ? diff : ggml_add(ctx, out, diff);
+            out    = out    == nullptr ? diff : ggml_add(ctx, out, diff);
+            energy = energy == nullptr ? ref  : ggml_add(ctx, energy, ref);
         }
 
-        return out;
+        // relative: SSD paths use FP16 intermediates, so slot vs prefix is not bit-identical.
+        // A wrong slot or token offset is NMSE ~1e-2, far above the limit.
+        return ggml_div(ctx, out, energy);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -9453,6 +9518,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
     }
+    for (int64_t tokens : {1, 33, 256, 1024}) {
+        for (bool strided : {false, true}) test_cases.emplace_back(new test_bolt_tail(tokens, strided));
+    }
+    for (int64_t w_rows : {1, 8}) {
+        test_cases.emplace_back(new test_rms_norm_mul_rows({1024, 8, 40, 1}, w_rows));
+    }
+    test_cases.emplace_back(new test_rms_norm_mul_rows({4096, 1, 64, 1}, 1));
     for (uint32_t n : {64, 1025}) {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));
@@ -9525,6 +9597,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 65, 2)); // SSD one chunk + 1-token sequential tail
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 128, 2)); // SSD multi-chunk, no tail (exercises the chunk-to-chunk state handoff)
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 128, 2, false, /*K=*/1, /*weak_decay=*/true)); // SSD multi-chunk, carried state not numerically negligible
+    // Nemotron-H Bolt shape (d_state 128, head 64, 128 heads, 8 groups), rollback K=9 inside the SSD path
+    for (int64_t nt : {197, 128, 300, 2053}) {
+        test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 128, 8, nt, nt == 300 ? 2 : 1, false, /*K=*/9, /*weak_decay=*/true));
+    }
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 128, 8, 2053, 1, false, /*K=*/1, /*weak_decay=*/true)); // same length, no rollback
+    for (int64_t nt : {197, 300, 2053}) {
+        test_cases.emplace_back(new test_ssm_scan_rollback(GGML_TYPE_F32, 128, 64, 128, 8, nt, nt == 300 ? 2 : 1, /*K=*/9));
+    }
 
     test_cases.emplace_back(new test_rwkv_wkv6(GGML_TYPE_F32, 32, 64, 1, 1));
     test_cases.emplace_back(new test_rwkv_wkv6(GGML_TYPE_F32, 32, 64, 32, 1));
@@ -9814,6 +9894,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
+
+    for (int64_t tokens : {1, 7, 32}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_XE2MX4, GGML_TYPE_F32, 64, tokens, 1024, {1, 1}, {1, 1}));
+    }
+
+    // XE2MX4 expert stacks: non-contiguous ids, broadcast up inputs and per-expert down inputs.
+    for (bool broadcast : {false, true}) {
+        for (int64_t tokens : {1, 7, 32}) {
+            for (int64_t width : {1024, 1536, 2560}) {
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_XE2MX4, GGML_TYPE_F32, 13, 9, broadcast, 65, tokens, width));
+            }
+        }
+    }
+
+    // Bolt expert widths (N % 128 == 0 hits the in-place SOA / NT=8 XE2MX4 path; IQ2_XXS grouped prefill)
+    for (ggml_type t : {GGML_TYPE_XE2MX4, GGML_TYPE_IQ2_XXS}) {
+        for (bool broadcast : {false, true}) {
+            for (int64_t tokens : {32, 200}) {
+                test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 64, 9, broadcast, 2304, tokens, 1024));
+                test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 64, 9, broadcast, 1024, tokens, 2304));
+            }
+        }
+    }
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));

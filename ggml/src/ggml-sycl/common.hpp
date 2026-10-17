@@ -508,6 +508,7 @@ struct ggml_backend_sycl_context {
 
 #ifdef GGML_SYCL_GRAPH
     std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
+    uint64_t lab_graph_sig = 0;
 #endif
 
     ggml_sycl_pool & host_pool(int device) {

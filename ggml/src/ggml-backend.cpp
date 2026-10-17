@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -825,6 +826,9 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+
+    ggml_backend_sched_split_hook split_hook;
+    void * split_hook_user_data;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1651,6 +1655,20 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// LLAMA_XE2_PREFILL_THREAD submits from two host threads; the Level Zero driver can deadlock
+// (mutex vs rwlock in appendKernelLaunch) when two threads append concurrently, so submissions
+// are serialized here while host waits stay outside the lock.
+static bool ggml_backend_sched_pair_thread() {
+    static const bool on = getenv("LLAMA_XE2_PREFILL_THREAD") && atoi(getenv("LLAMA_XE2_PREFILL_THREAD")) == 1;
+    return on;
+}
+static std::mutex & ggml_backend_sched_submit_mutex() {
+    static std::mutex mu;
+    return mu;
+}
+void ggml_backend_prefill_submit_lock(void)   { if (ggml_backend_sched_pair_thread()) ggml_backend_sched_submit_mutex().lock(); }
+void ggml_backend_prefill_submit_unlock(void) { if (ggml_backend_sched_pair_thread()) ggml_backend_sched_submit_mutex().unlock(); }
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1665,6 +1683,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        if (sched->split_hook) {
+            sched->split_hook(sched->split_hook_user_data, split_id, split_backend);
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1689,11 +1710,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
+                if (ggml_backend_sched_pair_thread()) {
+                    std::lock_guard<std::mutex> lk(ggml_backend_sched_submit_mutex());
+                    ggml_backend_tensor_copy(input, input_cpy);
+                } else {
+                    ggml_backend_tensor_copy(input, input_cpy);
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    if (ggml_backend_sched_pair_thread()) {
+                        // two prefill slots share each device queue, so wait on the host for this slot's event
+                        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    }
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
@@ -1787,19 +1818,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-                        ggml_backend_synchronize(input_backend);
+                        const int input_backend_id = ggml_backend_sched_backend_id(sched, input_backend);
+                        if (ggml_backend_sched_pair_thread() && input_backend_id >= 0 && sched->events[input_backend_id][sched->cur_copy] != NULL) {
+                            // only this slot's producing split, not later work another slot queued on that device
+                            ggml_backend_event_synchronize(sched->events[input_backend_id][sched->cur_copy]);
+                        } else {
+                            ggml_backend_synchronize(input_backend);
+                        }
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
-                        ggml_backend_tensor_copy(input, input_cpy);
+                        if (ggml_backend_sched_pair_thread()) {
+                            std::lock_guard<std::mutex> lk(ggml_backend_sched_submit_mutex());
+                            ggml_backend_tensor_copy(input, input_cpy);
+                        } else {
+                            ggml_backend_tensor_copy(input, input_cpy);
+                        }
                     }
                 }
             }
         }
 
         if (!sched->callback_eval) {
+            std::unique_lock<std::mutex> submit_lk;
+            if (ggml_backend_sched_pair_thread()) {
+                submit_lk = std::unique_lock<std::mutex>(ggml_backend_sched_submit_mutex());
+            }
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -1840,7 +1886,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-            ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+            if (ggml_backend_sched_pair_thread()) {
+                std::lock_guard<std::mutex> lk(ggml_backend_sched_submit_mutex());
+                ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+            } else {
+                ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+            }
         }
 
         prev_backend_id = split_backend_id;
@@ -2044,6 +2095,12 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
         // which avoids changes in the graph that could cause CUDA or other graphs to be disabled
         sched->next_copy = 0;
     }
+}
+
+void ggml_backend_sched_set_split_hook(ggml_backend_sched_t sched, ggml_backend_sched_split_hook hook, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->split_hook = hook;
+    sched->split_hook_user_data = user_data;
 }
 
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {

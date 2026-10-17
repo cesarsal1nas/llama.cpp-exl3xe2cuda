@@ -339,6 +339,7 @@ struct common_params_speculative_draft {
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
+    llama_context * ctx_mtp = nullptr; // lab: second (MTP) draft context when a draft model and draft-mtp are both on
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
@@ -939,6 +940,7 @@ struct common_init_result {
 
     common_sampler * sampler(llama_seq_id seq_id);
     void reset_samplers();
+    void reset_context(); // frees the context; context() returns nullptr afterwards
 
     std::vector<llama_adapter_lora_ptr> & lora();
 

@@ -344,4 +344,33 @@ bool ggml_sycl_xe2mx_lo_s44_glu(ggml_backend_sycl_context & ctx,
                                  int64_t M,
                                  int64_t g);
 
+// device-routed MoE: tiles[4*i] = {expert, row_start, padded rows, m base}, count in n_tiles_dev (device)
+bool ggml_sycl_xe2mx_moe_tiles(ggml_backend_sycl_context & ctx, const uint8_t * wp_soa, const int32_t * tiles,
+                               const int32_t * n_tiles_dev, const int8_t * A, const float * da, float * yp,
+                               int K, int N, int max_tiles, const int32_t * ri1 = nullptr, const int32_t * ri2 = nullptr,
+                               char * yout = nullptr, size_t y1 = 0, size_t y2 = 0);
+bool ggml_sycl_iq2_moe_tiles(ggml_backend_sycl_context & ctx, const uint8_t * w, size_t we, size_t wr,
+                             const uint32_t * grid32, const int32_t * tiles, const int32_t * n_tiles_dev,
+                             const int8_t * A, const float * da, float * yp, int K, int N, int max_tiles,
+                             const int32_t * ri1 = nullptr, const int32_t * ri2 = nullptr, char * yout = nullptr,
+                             size_t y1 = 0, size_t y2 = 0);
+int ggml_sycl_iq2_moe_tile_span();
+int ggml_sycl_xe2mx_moe_tile_span();
+bool ggml_sycl_iq2_moe_tiles_can_fuse(int N);
+bool ggml_sycl_xe2mx_moe_tiles_can_fuse(int N);
+bool ggml_sycl_xe2mx_moe_dpas(ggml_backend_sycl_context & ctx,
+                              const uint8_t * wp_soa,
+                              const int64_t * ep,
+                              const int8_t * A,
+                              const float * da,
+                              float * yp,
+                              int K,
+                              int N,
+                              int rows,
+                              int batch);
+
+bool ggml_sycl_iq2_moe_dpas(ggml_backend_sycl_context & ctx, const uint8_t * w, const int64_t * ep, size_t we, size_t wr,
+                            const uint32_t * grid32, const int8_t * A, const float * da, float * yp,
+                            int K, int N, int rows, int batch);
+
 #endif

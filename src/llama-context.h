@@ -11,6 +11,10 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <map>
 #include <vector>
 
@@ -235,7 +239,12 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens, bool synced = false);
+    struct layer_inp_pending_t { const llm_graph_result * res; size_t offset; size_t n_tokens; };
+    std::vector<layer_inp_pending_t> layer_inp_pending; // pipelined prefill reads deferred to batch end
+    bool ubatch_needs_layer_inp = false;
+    bool ubatch_wants_layer_inp = true; // lab: false for sequences routed away from the drafter
+    size_t layer_inp_keep_from = 0; // lab: rows of the current batch before this index are not copied out
 
     //
     // graph
@@ -369,6 +378,38 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+    ggml_backend_sched_ptr prefill_sched_other;
+    llm_graph_result_ptr prefill_graph_other;
+    bool prefill_pair_active = false;
+    std::vector<ggml_backend_event_t> prefill_fences_current;
+    std::vector<ggml_backend_event_t> prefill_fences_other;
+    bool prefill_fences_current_valid = false;
+    bool prefill_slot_flipped = false; // lab: sched/graph currently swapped to the other prefill slot
+    bool prefill_fences_other_valid = false;
+    // LLAMA_XE2_PREFILL_THREAD=1: each slot's scheduler submits on its own thread; a per-device
+    // turnstile keeps every in-order device queue in ubatch order.
+    struct prefill_turnstile {
+        std::mutex mu;
+        std::condition_variable cv;
+        uint64_t submitted[2] = {0, 0};
+        uint64_t next_seq = 0;
+        bool failed = false;
+    };
+    struct prefill_job {
+        llama_context * ctx = nullptr;
+        uint64_t seq = 0;
+        int last_dev = -1;
+        std::atomic<int> status{0};
+    };
+    std::shared_ptr<prefill_turnstile> prefill_gate;
+    std::thread prefill_thread_current;
+    std::thread prefill_thread_other;
+    std::unique_ptr<prefill_job> prefill_job_current;
+    std::unique_ptr<prefill_job> prefill_job_other;
+
+    void prefill_join(std::thread & t, std::unique_ptr<prefill_job> & job);
+    void prefill_join_all();
+    static void prefill_split_hook(void * ud, int split_id, ggml_backend_t backend);
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

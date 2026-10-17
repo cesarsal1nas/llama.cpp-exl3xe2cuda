@@ -14,6 +14,19 @@
 
 // TODO: extract the cache state used for graph computation into llama_memory_recurrent_context_i
 //       see the implementation of llama_kv_cache_context_i for an example how to do it
+// lab: snapshots a ubatch of n_tok tokens writes with K = n_rs_seq + 1 slots. Prefill-sized chunks
+// (> 64 tokens) are never verify batches, so they keep at most 2 (the K=1 GDN kernel path is the slow one:
+// plain cheap MTP long PP 2965 -> 2890-2939 when prefill wrote 1).
+static inline int64_t llama_rs_prefill_k(int64_t K) {
+    return K < 2 ? K : 2;
+}
+static inline int64_t llama_rs_snapshots_written(int64_t n_tok, int64_t K) {
+    if (n_tok > 64) {
+        K = llama_rs_prefill_k(K);
+    }
+    return n_tok < K ? n_tok : K;
+}
+
 class llama_memory_recurrent : public llama_memory_i {
 public:
     llama_memory_recurrent(
@@ -75,6 +88,7 @@ public:
 
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
+    std::vector<uint32_t> rs_valid; // lab: deepest rollback the last ubatch wrote a snapshot for
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 

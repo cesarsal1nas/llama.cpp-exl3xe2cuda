@@ -14,7 +14,10 @@
 #include <array>
 #include <assert.h>
 #include <atomic>
+#include <condition_variable>
+#include <thread>
 #include <chrono>
+#include <functional>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
@@ -29,6 +32,8 @@
 #include <cmath>
 #include <iostream>
 #include <fstream>
+#include <unordered_set>
+#include "gguf.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <regex>
@@ -65,6 +70,7 @@
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/exl3.hpp"
 #include "ggml-sycl/xe2mx.hpp"
+#include "ggml-sycl/xe2mx-a8.hpp"
 #include "ggml-sycl/fwht.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
@@ -412,11 +418,12 @@ static void ggml_sycl_apply_xe2_profile(const ggml_sycl_device_info & info) {
     }
     static const char * s4[][2] = {
         { "S44_STRAT_EXTRA", "k256" },            { "GGML_SYCL_XE2MX_LO", "1" },
-        { "GGML_SYCL_XE2MX_LO_HOST", "0" },       { "GGML_SYCL_XE2MX_LO_HOSTPACK", "1" },
-        { "GGML_SYCL_XE2MX_LO_INLINE", "0" },     { "GGML_SYCL_XE2MX_LO_NOPACK_FFN", "1" },
+        { "GGML_SYCL_XE2MX_LO_HOST", "0" },       { "GGML_SYCL_XE2MX_LO_INLINE", "0" },     { "GGML_SYCL_XE2MX_LO_NOPACK_FFN", "1" },
         { "GGML_SYCL_XE2MX_LO_GEMV", "1" },       { "GGML_SYCL_XE2MX_S4ACC", "3" },
         { "GGML_SYCL_XE2MX_Q32V", "1" },          { "GGML_SYCL_XE2MX_NF_KEEP_MB", "0" },
         { "GGML_SYCL_XE2MX_S44", "1" },           { "GGML_SYCL_XE2MX_S44N", "4096" },
+        { "GGML_SYCL_XE2MX_S44FROM", "0" },       { "GGML_SYCL_XE2MX_S44FFNFROM", "0" },
+        { "GGML_SYCL_XE2MX_S44AROW", "0" },
         { "GGML_SYCL_XE2MX_S44A", "8" },          { "GGML_SYCL_XE2MX_S44CLIP", "80" },
         { "GGML_SYCL_XE2MX_S44ADIV", "8" },       { "GGML_SYCL_XE2MX_S44FPACK", "1" },
         { "GGML_SYCL_XE2MX_S44HILP", "4" },       { "GGML_SYCL_XE2MX_S44H", "1" },
@@ -989,6 +996,36 @@ ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
     if (is_cpy_supported) {
         ggml_backend_sycl_buffer_context * src_ctx = (ggml_backend_sycl_buffer_context *)src->buffer->context;
         ggml_backend_sycl_buffer_context * dst_ctx = (ggml_backend_sycl_buffer_context *)dst->buffer->context;
+        static const bool pair_thread = getenv("LLAMA_XE2_PREFILL_THREAD") && atoi(getenv("LLAMA_XE2_PREFILL_THREAD")) == 1;
+        if (pair_thread && src_ctx->device != dst_ctx->device) {
+            // The scheduler already waited on the producing split's event (source) and on this slot's
+            // previous use of dst (event). Copy on side in-order queues so later work another slot queued
+            // on either compute queue is neither waited on nor overtaken.
+            static std::mutex mu;
+            std::lock_guard<std::mutex> lk(mu);
+            static sycl::queue * side[GGML_SYCL_MAX_DEVICES] = {};
+            static char * pin[GGML_SYCL_MAX_DEVICES] = {};
+            static size_t pin_cap[GGML_SYCL_MAX_DEVICES] = {};
+            const size_t size = ggml_nbytes(src);
+            const int ds[2] = { src_ctx->device, dst_ctx->device };
+            queue_ptr qs[2] = { src_ctx->stream, dst_ctx->stream };
+            for (int k = 0; k < 2; ++k) {
+                const int d = ds[k];
+                if (!side[d]) {
+                    side[d] = new sycl::queue(qs[k]->get_context(), qs[k]->get_device(), sycl::property::queue::in_order());
+                }
+                if (pin_cap[d] < size) {
+                    if (pin[d]) sycl::free(pin[d], *side[d]);
+                    pin[d] = (char *) sycl::malloc_host(size, *side[d]);
+                    GGML_ASSERT(pin[d]);
+                    pin_cap[d] = size;
+                }
+            }
+            SYCL_CHECK(CHECK_TRY_ERROR(side[ds[0]]->memcpy(pin[ds[0]], src->data, size).wait()));
+            memcpy(pin[ds[1]], pin[ds[0]], size);
+            SYCL_CHECK(CHECK_TRY_ERROR(side[ds[1]]->memcpy(dst->data, pin[ds[1]], size).wait()));
+            return true;
+        }
 
         ggml_sycl_set_device(src_ctx->device);
         /*
@@ -3176,7 +3213,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
 #ifdef GGML_SYCL_F16
     bool use_fp16 = true;  // TODO(Yu) SYCL capability check
 #else
-    bool use_fp16 = false;
+    bool use_fp16 = true;
 #endif
 
 #if GGML_SYCL_DNNL && defined(GGML_SYCL_HAS_BF16)
@@ -5512,6 +5549,58 @@ __dpct_inline__ static void k_copy_dst_from_contiguous(
     }
 }
 
+static bool ggml_sycl_xe2mx_pack_moe_soa(ggml_backend_sycl_context & ctx, const ggml_tensor * w) {
+    if (!w || w->type != GGML_TYPE_XE2MX4 || !w->data) {
+        return false;
+    }
+    ggml_tensor_extra_gpu * extra = (ggml_tensor_extra_gpu *) w->extra;
+    if (!extra) {
+        return false;
+    }
+    if (extra->optimized_feature.reorder) {
+        return true;
+    }
+    const int64_t K = w->ne[0], N = w->ne[1], E = w->ne[2];
+    if ((K % 64) != 0 || (N % 16) != 0 || E <= 1) {
+        return false;
+    }
+    const int64_t nb = K / 32;
+    const size_t pitch = (size_t) nb * 16;
+    const size_t we = w->nb[2], wr = w->nb[1];
+    if (we != (size_t) N * pitch + (size_t) nb * (size_t) N * sizeof(uint16_t)) {
+        return false;
+    }
+    queue_ptr stream = ctx.stream();
+    ggml_sycl_pool_alloc<uint8_t> tmp(ctx.pool(), we);
+    uint8_t * tmp_e = tmp.get();
+    uint8_t * wdata = (uint8_t *) w->data;
+    for (int64_t e = 0; e < E; ++e) {
+        uint8_t * we_ptr = wdata + (size_t) e * we;
+        stream->memcpy(tmp_e, we_ptr, we);
+        stream->parallel_for(sycl::range<1>((size_t) N * (size_t) nb * 4), [=](sycl::id<1> it) {
+            const int64_t idx = (int64_t) it[0];
+            const int64_t j4  = idx & 3;
+            const int64_t b   = idx >> 2;
+            const int64_t kb  = b % nb;
+            const int64_t row = b / nb;
+            const uint8_t * blk = tmp_e + (size_t) row * wr + (size_t) kb * 18;
+            if (j4 == 0) {
+                uint16_t * d16 = (uint16_t *)(we_ptr + (size_t) N * pitch);
+                uint16_t dval;
+                memcpy(&dval, blk, sizeof(uint16_t));
+                d16[(size_t) kb * (size_t) N + (size_t) row] = dval;
+            }
+            uint32_t qv;
+            memcpy(&qv, blk + 2 + j4 * 4, sizeof(uint32_t));
+            uint32_t * qs32 = (uint32_t *)(we_ptr + (size_t) row * pitch + (size_t) kb * 16);
+            qs32[j4] = qv;
+        });
+    }
+    stream->wait();
+    extra->optimized_feature.reorder = true;
+    return true;
+}
+
 // Fused MoE TG fast path. Returns false to fall back to the per-expert loop below.
 static bool ggml_sycl_mul_mat_id_mmvq_fused(
     ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
@@ -5551,7 +5640,11 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const int       nrows            = (int) src0->ne[1];
     const int       n_src1_rows      = (int) (ne11 * n_tokens);
 
-    opt_for_reorder_id(&ctx, src0);
+    if (src0->type == GGML_TYPE_XE2MX4) {
+        ggml_sycl_xe2mx_pack_moe_soa(ctx, src0);
+    } else {
+        opt_for_reorder_id(&ctx, src0);
+    }
     const ggml_tensor_extra_gpu * src0_extra =
         static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
     const bool use_reorder = src0_extra && src0_extra->optimized_feature.reorder;
@@ -5571,8 +5664,9 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
             if (ctx.moe_q8) {
                 ggml_sycl_free_device(ctx.moe_q8, *stream);
             }
-            ctx.moe_q8     = (char *) ggml_sycl_malloc_device(q8_bytes, *stream);
-            ctx.moe_q8_cap = ctx.moe_q8 ? q8_bytes : 0;
+            const size_t alloc_bytes = std::max(q8_bytes, (size_t) 64 * bytes_per_qrow);
+            ctx.moe_q8     = (char *) ggml_sycl_malloc_device(alloc_bytes, *stream);
+            ctx.moe_q8_cap = ctx.moe_q8 ? alloc_bytes : 0;
         }
         src1_ddq = ctx.moe_q8;
         if (!src1_ddq) {
@@ -5651,11 +5745,840 @@ static void mmid_counting_sort_rows(
     }
 }
 
+// Expert stacks use either serialized block layout or in-place per-expert SOA layout (reorder == true).
+// One subgroup computes one output row; ids remain on the Intel device.
+static void ggml_sycl_mul_mat_id_xe2mx_native(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * w = dst->src[0];
+    const ggml_tensor * x = dst->src[1];
+    const ggml_tensor * ids = dst->src[2];
+    GGML_ASSERT(w->type == GGML_TYPE_XE2MX4 && x->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && w->ne[3] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(w->ne[0] == x->ne[0] && w->ne[0] % QK_XE2MX4 == 0);
+    GGML_ASSERT(x->ne[1] == 1 || x->ne[1] == ids->ne[0]);
+    GGML_ASSERT(x->ne[2] == ids->ne[1] && dst->ne[1] == ids->ne[0] && dst->ne[2] == ids->ne[1]);
+    const ggml_tensor_extra_gpu * extra = (const ggml_tensor_extra_gpu *) w->extra;
+    const bool is_soa = extra && extra->optimized_feature.reorder;
+    const char * wp = (const char *) w->data;
+    const char * xp = (const char *) x->data;
+    const char * ip = (const char *) ids->data;
+    char * yp = (char *) dst->data;
+    const int64_t kblocks = w->ne[0] / QK_XE2MX4;
+    const int64_t nr = w->ne[1], selected = ids->ne[0], nt = ids->ne[1], xc = x->ne[1];
+    const size_t pitch = (size_t) kblocks * 16;
+    const size_t wr = w->nb[1], we = w->nb[2];
+    const size_t x0 = x->nb[0], x1 = x->nb[1], x2 = x->nb[2];
+    const size_t i0 = ids->nb[0], i1 = ids->nb[1];
+    const size_t y0 = dst->nb[0], y1 = dst->nb[1], y2 = dst->nb[2];
+    const sycl::range<3> groups((size_t) nt, (size_t) selected, (size_t) nr);
+    const sycl::range<3> local(1, 1, WARP_SIZE);
+    ctx.stream()->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(groups * local, local),
+            [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                const int64_t tok = it.get_group(0), slot = it.get_group(1), row = it.get_group(2);
+                const int32_t e = *(const int32_t *) (ip + tok * i1 + slot * i0);
+                const char * xv = xp + tok * x2 + (slot % xc) * x1;
+                float sum = 0.0f;
+                const int lane = it.get_local_id(2);
+                if (is_soa) {
+                    const uint8_t * ep = (const uint8_t *)(wp + (size_t) e * we);
+                    const uint8_t * qrow = ep + (size_t) row * pitch;
+                    const sycl::half * dpl = (const sycl::half *)(ep + (size_t) nr * pitch);
+                    for (int64_t b = lane; b < kblocks; b += WARP_SIZE) {
+                        const float d = (float) dpl[(size_t) b * (size_t) nr + (size_t) row];
+                        const uint8_t * qs = qrow + (size_t) b * 16;
+                        float acc = 0.0f;
+#pragma unroll
+                        for (int j = 0; j < 16; ++j) {
+                            const uint8_t q = qs[j];
+                            const float a = *(const float *) (xv + (b * 32 + 2 * j) * x0);
+                            const float z = *(const float *) (xv + (b * 32 + 2 * j + 1) * x0);
+                            acc += ((int) (q & 15) - 8) * a + ((int) (q >> 4) - 8) * z;
+                        }
+                        sum += d * acc;
+                    }
+                } else {
+                    const block_xe2mx4 * wb = (const block_xe2mx4 *) (wp + (size_t) e * we + row * wr);
+                    for (int64_t b = lane; b < kblocks; b += WARP_SIZE) {
+                        const float d = (float) wb[b].d;
+                        float acc = 0.0f;
+#pragma unroll
+                        for (int j = 0; j < 16; ++j) {
+                            const uint8_t q = wb[b].qs[j];
+                            const float a = *(const float *) (xv + (b * 32 + 2 * j) * x0);
+                            const float z = *(const float *) (xv + (b * 32 + 2 * j + 1) * x0);
+                            acc += ((int) (q & 15) - 8) * a + ((int) (q >> 4) - 8) * z;
+                        }
+                        sum += d * acc;
+                    }
+                }
+                sum = sycl::reduce_over_group(it.get_sub_group(), sum, sycl::plus<float>());
+                if (lane == 0) {
+                    *(float *) (yp + tok * y2 + slot * y1 + row * y0) = sum;
+                }
+            });
+    });
+}
+
+struct Xe2mxRoutingCache {
+    sycl::queue * q = nullptr;
+    const void * ids_data = nullptr;
+    int64_t E = 0;
+    int64_t routed = 0;
+    int64_t group = 0;
+    int64_t total_padded_rows = 0;
+    int64_t max_group_rows = 0;
+    int64_t max_batch = 1;
+    std::vector<int64_t> counts;
+    std::vector<int64_t> offsets;
+    std::vector<int64_t> order;
+    std::vector<mmid_row_mapping> mapping;
+    std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>> groups; // (base, batch, rows, row_start)
+    int32_t * d_ri1 = nullptr;
+    int32_t * d_ri2 = nullptr;
+    int64_t * d_ep  = nullptr;
+    size_t d_rows_cap = 0;
+    size_t d_ep_cap   = 0;
+};
+
+// GGML_SYCL_XE2MX_MOE_DEVROUTE=1 routes XE2MX4 MoE prefill fully on the device
+// (atomic counting sort + tile list built by the GPU), so the op never waits on the host.
+struct Xe2mxDevRoute {
+    sycl::queue * q = nullptr;
+    const void * ids_data = nullptr;
+    int64_t E = 0, routed = 0;
+    int32_t * counts = nullptr;   // [E]
+    int32_t * offs   = nullptr;   // [E]
+    int32_t * cursor = nullptr;   // [E]
+    int32_t * tiles  = nullptr;   // [4*max_tiles]
+    int32_t * ntiles = nullptr;   // [1]
+    int32_t * ri1 = nullptr;
+    int32_t * ri2 = nullptr;
+    size_t cap_rows = 0, cap_E = 0, cap_T = 0;
+    int64_t span = 0;
+};
+
+static bool ggml_sycl_mul_mat_id_xe2mx_devroute(ggml_backend_sycl_context & ctx, ggml_tensor * dst, int dev_id) {
+    const ggml_tensor * w = dst->src[0];
+    const ggml_tensor * x = dst->src[1];
+    const ggml_tensor * ids = dst->src[2];
+    const int64_t K = w->ne[0], N = w->ne[1], E = w->ne[2];
+    const int64_t n_used = ids->ne[0], n_tok = ids->ne[1];
+    const int64_t routed = n_used * n_tok, channels = x->ne[1];
+    const bool is_iq2 = w->type == GGML_TYPE_IQ2_XXS;
+    if ((w->type != GGML_TYPE_XE2MX4 && !is_iq2) || !g_ggml_sycl_enable_esimd || (K % 64) != 0 || K < 128 ||
+        (N % 16) != 0 || ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (is_iq2) {
+        // only the keeper IQ2 kernel (DPAS + DIRECT + SLM=48) has a tiled variant
+        if (!ggml_sycl_get_env("GGML_SYCL_IQ2_MOE_DPAS", 0) || !ggml_sycl_get_env("GGML_SYCL_IQ2_MOE_DIRECT", 0) ||
+            ggml_sycl_get_env("GGML_SYCL_IQ2_MOE_SLM", 0) != 48 || (K % 256) != 0 || (N % 64) != 0) {
+            return false;
+        }
+    } else if (!ggml_sycl_xe2mx_pack_moe_soa(ctx, w)) {
+        return false;
+    }
+    const queue_ptr stream = ctx.stream();
+    const int64_t span = is_iq2 ? ggml_sycl_iq2_moe_tile_span() : ggml_sycl_xe2mx_moe_tile_span();
+    const int64_t ub_rows = routed + E * 7;                  // each expert padded to 8 rows
+    const int64_t max_tiles = (ub_rows + span - 1) / span + E;
+
+    static Xe2mxDevRoute st[GGML_SYCL_MAX_DEVICES];
+    Xe2mxDevRoute & r = st[dev_id];
+    const bool hit = strstr(w->name, "ffn_down_exps") && r.q == stream && r.ids_data == ids->data &&
+                     r.E == E && r.routed == routed && r.span == span;
+    if (!hit) {
+        auto grow = [&](int32_t *& ptr, size_t & cap, size_t need) {
+            if (cap < need) {
+                if (ptr) ggml_sycl_free_device(ptr, *stream);
+                const size_t c = std::max(need, (size_t) 256);
+                ptr = (int32_t *) ggml_sycl_malloc_device(c * sizeof(int32_t), *stream);
+                cap = c;
+            }
+        };
+        if (r.cap_rows < (size_t) ub_rows) {
+            size_t c1 = r.cap_rows, c2 = r.cap_rows;
+            grow(r.ri1, c1, ub_rows);
+            grow(r.ri2, c2, ub_rows);
+            r.cap_rows = c1;
+        }
+        if (r.cap_E < (size_t) E) {
+            size_t a = r.cap_E, b = r.cap_E, c = r.cap_E;
+            grow(r.counts, a, E); grow(r.offs, b, E); grow(r.cursor, c, E);
+            r.cap_E = a;
+        }
+        size_t ct = r.cap_T;
+        grow(r.tiles, ct, (size_t) 4 * max_tiles);
+        r.cap_T = ct;
+        if (!r.ntiles) r.ntiles = (int32_t *) ggml_sycl_malloc_device(sizeof(int32_t) * 4, *stream);
+
+        int32_t * counts = r.counts; int32_t * offs = r.offs; int32_t * cursor = r.cursor;
+        int32_t * tiles = r.tiles; int32_t * ntiles = r.ntiles; int32_t * ri1 = r.ri1; int32_t * ri2 = r.ri2;
+        const char * idp = (const char *) ids->data;
+        const size_t inb0 = ids->nb[0], inb1 = ids->nb[1];
+        const int32_t sp = (int32_t) span;
+        stream->memset(counts, 0, E * sizeof(int32_t));
+        stream->memset(ri1, 0xff, ub_rows * sizeof(int32_t));
+        stream->parallel_for(sycl::range<1>((size_t) routed), [=](sycl::id<1> it) {
+            const int64_t i = it[0];
+            const int64_t tok = i / n_used, slot = i % n_used;
+            const int32_t e = *(const int32_t *) (idp + tok * inb1 + slot * inb0);
+            sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::global_space> a(counts[e]);
+            a.fetch_add(1);
+        });
+        stream->single_task([=]() {
+            int32_t off = 0, t = 0;
+            for (int32_t e = 0; e < (int32_t) E; ++e) {
+                const int32_t c = counts[e];
+                const int32_t padded = (c + 7) & ~7;
+                offs[e] = off;
+                cursor[e] = 0;
+                for (int32_t m = 0; m < padded; m += sp) {
+                    tiles[4 * t + 0] = e;
+                    tiles[4 * t + 1] = off;
+                    tiles[4 * t + 2] = padded;
+                    tiles[4 * t + 3] = m;
+                    ++t;
+                }
+                off += padded;
+            }
+            ntiles[0] = t;
+        });
+        stream->parallel_for(sycl::range<1>((size_t) routed), [=](sycl::id<1> it) {
+            const int64_t i = it[0];
+            const int64_t tok = i / n_used, slot = i % n_used;
+            const int32_t e = *(const int32_t *) (idp + tok * inb1 + slot * inb0);
+            sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::global_space> a(cursor[e]);
+            const int32_t pos = offs[e] + a.fetch_add(1);
+            ri1[pos] = (int32_t) slot;
+            ri2[pos] = (int32_t) tok;
+        });
+        r.q = stream; r.ids_data = ids->data; r.E = E; r.routed = routed; r.span = span;
+    }
+
+    const int64_t nb = K / 32;
+    ggml_sycl_pool_alloc<int8_t> Aq(ctx.pool(), (size_t) ub_rows * (size_t) K);
+    ggml_sycl_pool_alloc<float> Ad(ctx.pool(), (size_t) ub_rows * (size_t) nb);
+    // GGML_SYCL_MOE_FUSE_SCATTER=1 writes GEMM rows straight to dst (no temp buffer, no scatter kernel)
+    static const bool fuse_sc = ggml_sycl_get_env("GGML_SYCL_MOE_FUSE_SCATTER", 0) != 0;
+    // fuse only when the tile variant the dispatcher will pick actually stores rows to dst
+    const bool fused = fuse_sc && dst->nb[0] == sizeof(float) &&
+                       (is_iq2 ? ggml_sycl_iq2_moe_tiles_can_fuse((int) N)
+                               : ggml_sycl_xe2mx_moe_tiles_can_fuse((int) N));
+    ggml_sycl_pool_alloc<float> result(ctx.pool(), fused ? 1 : (size_t) ub_rows * (size_t) N);
+    int8_t * A = Aq.get(); float * da = Ad.get(); float * yp = result.get();
+    const int32_t * ri1 = r.ri1; const int32_t * ri2 = r.ri2;
+    const char * xin = (const char *) x->data;
+    char * yout = (char *) dst->data;
+    const size_t x0 = x->nb[0], x1 = x->nb[1], x2 = x->nb[2];
+    const size_t y0 = dst->nb[0], y1 = dst->nb[1], y2 = dst->nb[2];
+
+    stream->parallel_for(sycl::range<1>((size_t) ub_rows * (size_t) nb), [=](sycl::id<1> it) {
+        const int64_t idx = (int64_t) it[0];
+        const int64_t pr = idx / nb;
+        const int64_t ib = idx % nb;
+        int8_t * out = A + (size_t) pr * (size_t) K + (size_t) ib * 32;
+        const int32_t i1 = ri1[pr];
+        if (i1 < 0) {
+            da[idx] = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 32; ++k) out[k] = 0;
+            return;
+        }
+        const int32_t i2 = ri2[pr];
+        const char * row_ptr = xin + (size_t)(i1 % channels) * x1 + (size_t) i2 * x2 + (size_t) ib * 32 * x0;
+        float af[32];
+        float amax = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 32; ++k) {
+            const float val = *(const float *)(row_ptr + (size_t) k * x0);
+            af[k] = val;
+            amax = sycl::fmax(amax, sycl::fabs(val));
+        }
+        const float s = amax > 0.0f ? amax / 127.0f : 0.0f;
+        da[idx] = s;
+        const float id = s > 0.0f ? 1.0f / s : 0.0f;
+#pragma unroll
+        for (int k = 0; k < 32; ++k) {
+            const float xq = af[k] * id;
+            int q = (int)(xq + (xq >= 0.0f ? 0.5f : -0.5f));
+            if (q < -127) q = -127;
+            if (q > 127)  q = 127;
+            out[k] = (int8_t) q;
+        }
+    });
+    bool launched;
+    if (is_iq2) {
+        static uint32_t * grid_dev[GGML_SYCL_MAX_DEVICES] = {};
+        uint32_t *& g32 = grid_dev[dev_id];
+        if (!g32) {
+            g32 = (uint32_t *) ggml_sycl_malloc_device(256 * sizeof(uint64_t), *stream);
+            stream->memcpy(g32, iq2xxs_grid, 256 * sizeof(uint64_t)).wait();   // once per device
+        }
+        launched = ggml_sycl_iq2_moe_tiles(ctx, (const uint8_t *) w->data, w->nb[2], w->nb[1], g32, r.tiles, r.ntiles,
+                                           A, da, yp, (int) K, (int) N, (int) max_tiles,
+                                           fused ? ri1 : nullptr, ri2, fused ? yout : nullptr, y1, y2);
+    } else {
+        launched = ggml_sycl_xe2mx_moe_tiles(ctx, (const uint8_t *) w->data, r.tiles, r.ntiles, A, da, yp,
+                                             (int) K, (int) N, (int) max_tiles,
+                                             fused ? ri1 : nullptr, ri2, fused ? yout : nullptr, y1, y2);
+    }
+    if (!launched) {
+        GGML_ABORT("xe2mx devroute tiles launch failed");
+    }
+    if (!fused) {
+    stream->parallel_for(sycl::range<1>((size_t) ub_rows * (size_t) N), [=](sycl::id<1> it) {
+        const int64_t flat = it[0];
+        const int64_t n = flat % N;
+        const int64_t pr = flat / N;
+        const int32_t i1 = ri1[pr];
+        if (i1 >= 0) {
+            const int32_t i2 = ri2[pr];
+            *(float *)(yout + (size_t) i1 * y1 + (size_t) i2 * y2 + (size_t) n * y0) = yp[flat];
+        }
+    });
+    }
+    return true;
+}
+
+// Bounded expert-local reconstruction plus Intel matrix GEMM, without a whole-model FP16 copy.
+// Routing is counted once per operation; all gathers, reconstruction, GEMMs and scatters run on Intel.
+static void ggml_sycl_mul_mat_id_xe2mx_prefill(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * w = dst->src[0];
+    const ggml_tensor * x = dst->src[1];
+    const ggml_tensor * ids = dst->src[2];
+    const int64_t K=w->ne[0], N=w->ne[1], E=w->ne[2];
+    const int64_t routed=ids->ne[0]*ids->ne[1], channels=x->ne[1];
+    const queue_ptr stream=ctx.stream();
+    const int64_t group=std::max(1,std::min(32,ggml_sycl_get_env("GGML_SYCL_XE2MX_MOE_GROUP",16)));
+
+    // per-device: two prefill slots on different cards must not serialize on one global mutex
+    static std::mutex rcache_mu[GGML_SYCL_MAX_DEVICES];
+    static Xe2mxRoutingCache rcache[GGML_SYCL_MAX_DEVICES];
+    const int dev_id = std::max(0, std::min(GGML_SYCL_MAX_DEVICES - 1, ctx.device));
+
+    std::lock_guard<std::mutex> lk(rcache_mu[dev_id]);
+    static const bool devroute = ggml_sycl_get_env("GGML_SYCL_XE2MX_MOE_DEVROUTE", 0) != 0;
+    if (devroute && ggml_sycl_mul_mat_id_xe2mx_devroute(ctx, dst, dev_id)) {
+        return;
+    }
+    Xe2mxRoutingCache & rc = rcache[dev_id];
+    const bool hit = (channels > 1 && w && strstr(w->name, "ffn_down_exps") &&
+                      rc.q == stream && rc.ids_data == ids->data && rc.E == E &&
+                      rc.routed == routed && rc.group == group &&
+                      rc.d_ri1 != nullptr && rc.d_ri2 != nullptr && rc.d_ep != nullptr);
+
+    if (!hit) {
+        std::vector<char> host_ids(ggml_nbytes(ids));
+        stream->memcpy(host_ids.data(),ids->data,host_ids.size()).wait();
+        std::vector<int64_t> raw_counts, raw_offsets;
+        rc.mapping.clear();
+        rc.groups.clear();
+        mmid_counting_sort_rows(ids,host_ids.data(),ids->ne[0],E,routed,raw_counts,raw_offsets,rc.mapping);
+        rc.order.resize(E);
+        rc.counts.resize(E);
+        rc.offsets.resize(E);
+        for (int64_t e=0;e<E;++e) { rc.order[e]=e; }
+        std::sort(rc.order.begin(),rc.order.end(),[&](int64_t a,int64_t b) { return raw_counts[a]>raw_counts[b]; });
+        for (int64_t e=0;e<E;++e) {
+            rc.counts[e]=raw_counts[rc.order[e]];
+            rc.offsets[e]=raw_offsets[rc.order[e]];
+        }
+        // IQ2 s8 DPAS wants M>=32 (gemm_s8_vnni); XE2MX4 DPAS pads to 8.
+        const int tight = w->type == GGML_TYPE_IQ2_XXS && ggml_sycl_get_env("GGML_SYCL_IQ2_MOE_DIRECT", 0)
+                        ? ggml_sycl_get_env("GGML_SYCL_IQ2_MOE_TIGHT", 0) : 0;
+        const int row_align = tight ? 8 : ((w->type == GGML_TYPE_IQ2_XXS && ggml_sycl_get_env("GGML_SYCL_IQ2_MOE_DPAS", 0)) ? 32 : 8);
+        int64_t total_padded_rows = 0, max_group_rows = 0, max_batch = 1;
+        for (int64_t base=0;base<E && rc.counts[base]>0;) {
+            const int64_t rows=GGML_PAD(rc.counts[base], row_align);
+            int64_t batch=std::min(group,E-base);
+            // s8 pack is K*N bytes/expert; fp16 path is 2*K*N. Cap scratch ~256 MiB.
+            const int64_t w_bytes = (w->type == GGML_TYPE_IQ2_XXS) ? (K * N) : (K * N * 2);
+            while (batch>1 && (batch*rows*(K*2+N*4)+batch*w_bytes)>256*1024*1024) { batch=(batch+1)/2; }
+            while (batch>1 && rc.counts[base+batch-1]==0) { --batch; }
+            if (tight == 1) {
+                while (batch > 1 && GGML_PAD(rc.counts[base + batch - 1], row_align) != rows) --batch;
+            } else if (tight == 2) {
+                while (batch > 1 && rc.counts[base + batch - 1] * 10 < rows * 9) --batch;
+            }
+            rc.groups.emplace_back(base, batch, rows, total_padded_rows);
+            total_padded_rows += batch * rows;
+            max_group_rows = std::max(max_group_rows, batch * rows);
+            max_batch = std::max(max_batch, batch);
+            base += batch;
+        }
+        rc.q = stream;
+        rc.ids_data = ids->data;
+        rc.E = E;
+        rc.routed = routed;
+        rc.group = group;
+        rc.total_padded_rows = total_padded_rows;
+        rc.max_group_rows = max_group_rows;
+        rc.max_batch = max_batch;
+
+        if (!rc.groups.empty()) {
+            std::vector<int32_t> host_i1(total_padded_rows, -1);
+            std::vector<int32_t> host_i2(total_padded_rows, -1);
+            for (const auto & g : rc.groups) {
+                const int64_t base = std::get<0>(g);
+                const int64_t batch = std::get<1>(g);
+                const int64_t rows = std::get<2>(g);
+                const int64_t row_start = std::get<3>(g);
+                for (int64_t e = 0; e < batch; ++e) {
+                    const int64_t cnt = rc.counts[base + e];
+                    const int64_t off = rc.offsets[base + e];
+                    const int64_t dst_row0 = row_start + e * rows;
+                    for (int64_t r = 0; r < cnt; ++r) {
+                        const mmid_row_mapping m = rc.mapping[off + r];
+                        host_i1[dst_row0 + r] = m.i1;
+                        host_i2[dst_row0 + r] = m.i2;
+                    }
+                }
+            }
+            if (rc.d_rows_cap < (size_t) total_padded_rows) {
+                if (rc.d_ri1) ggml_sycl_free_device(rc.d_ri1, *stream);
+                if (rc.d_ri2) ggml_sycl_free_device(rc.d_ri2, *stream);
+                const size_t cap = std::max((size_t) total_padded_rows, (size_t) 65536);
+                rc.d_ri1 = (int32_t *) ggml_sycl_malloc_device(cap * sizeof(int32_t), *stream);
+                rc.d_ri2 = (int32_t *) ggml_sycl_malloc_device(cap * sizeof(int32_t), *stream);
+                rc.d_rows_cap = (rc.d_ri1 && rc.d_ri2) ? cap : 0;
+            }
+            if (rc.d_ep_cap < (size_t) E) {
+                if (rc.d_ep) ggml_sycl_free_device(rc.d_ep, *stream);
+                const size_t cap = std::max((size_t) E, (size_t) 256);
+                rc.d_ep = (int64_t *) ggml_sycl_malloc_device(cap * sizeof(int64_t), *stream);
+                rc.d_ep_cap = rc.d_ep ? cap : 0;
+            }
+            stream->memcpy(rc.d_ri1, host_i1.data(), total_padded_rows * sizeof(int32_t));
+            stream->memcpy(rc.d_ri2, host_i2.data(), total_padded_rows * sizeof(int32_t));
+            stream->memcpy(rc.d_ep, rc.order.data(), E * sizeof(int64_t)).wait();
+        }
+    }
+
+    if (rc.groups.empty()) {
+        return;
+    }
+
+    const int64_t total_padded_rows = rc.total_padded_rows;
+    const int64_t max_batch = rc.max_batch;
+
+    ggml_sycl_pool_alloc<float> result(ctx.pool(), total_padded_rows * N);
+
+    int32_t * ri1 = rc.d_ri1;
+    int32_t * ri2 = rc.d_ri2;
+    int64_t * ep  = rc.d_ep;
+    float * yp    = result.get();
+
+    const char * xin = (const char *) x->data;
+    const char * win = (const char *) w->data;
+    char * yout = (char *) dst->data;
+    const size_t x0 = x->nb[0], x1 = x->nb[1], x2 = x->nb[2], we = w->nb[2], wr = w->nb[1];
+    const size_t y0 = dst->nb[0], y1 = dst->nb[1], y2 = dst->nb[2];
+
+    const int64_t Npad = GGML_PAD(N, 64);
+    const bool use_dpas = w->type == GGML_TYPE_XE2MX4 &&
+                          g_ggml_sycl_enable_esimd && ggml_sycl_get_env("GGML_SYCL_XE2MX_MOE_DPAS", 1) != 0 &&
+                          (K % 64) == 0 && K >= 128;
+    // IQ2_XXS codebook -> int8 weights (grid values 8/25/43 with signs) + fp16 per-32 scale,
+    // then existing s8x s8 DPAS. Avoids materializing full fp16 expert weights.
+    const bool use_iq2_dpas = w->type == GGML_TYPE_IQ2_XXS &&
+                              g_ggml_sycl_enable_esimd && ggml_sycl_get_env("GGML_SYCL_IQ2_MOE_DPAS", 0) != 0 &&
+                              (K % 64) == 0 && (N % 16) == 0 && K >= 128 && N >= 16;
+
+    if (use_iq2_dpas) {
+        const int64_t nb = K / 32;
+        // gemm_s8_soa: W8 is [K][pitch] (pitch>=N), d16 is [nb][N]
+        ggml_sycl_pool_alloc<int8_t> Aq(ctx.pool(), (size_t) total_padded_rows * (size_t) K);
+        ggml_sycl_pool_alloc<float> Ad(ctx.pool(), (size_t) total_padded_rows * (size_t) nb);
+        const bool iq2_direct_alloc = ggml_sycl_get_env("GGML_SYCL_IQ2_MOE_DIRECT", 0) != 0;
+        ggml_sycl_pool_alloc<int8_t> W8p(ctx.pool(), iq2_direct_alloc ? 1 : (size_t) max_batch * (size_t) K * (size_t) N);
+        ggml_sycl_pool_alloc<uint16_t> D16p(ctx.pool(), iq2_direct_alloc ? 1 : (size_t) max_batch * (size_t) nb * (size_t) N);
+
+        int8_t * A = Aq.get();
+        float * da = Ad.get();
+        int8_t * W8 = W8p.get();
+        uint16_t * D16 = D16p.get();
+
+        // 1. Gather & quantize activations to int8 (same as XE2MX4 MoE DPAS)
+        stream->parallel_for(sycl::range<1>((size_t) total_padded_rows * (size_t) nb), [=](sycl::id<1> it) {
+            const int64_t idx = (int64_t) it[0];
+            const int64_t pr = idx / nb;
+            const int64_t ib = idx % nb;
+            int8_t * out = A + (size_t) pr * (size_t) K + (size_t) ib * 32;
+            const int32_t i1 = ri1[pr];
+            if (i1 < 0) {
+                da[idx] = 0.0f;
+#pragma unroll
+                for (int k = 0; k < 32; ++k) {
+                    out[k] = 0;
+                }
+                return;
+            }
+            const int32_t i2 = ri2[pr];
+            const char * row_ptr = xin + (size_t)(i1 % channels) * x1 + (size_t) i2 * x2 + (size_t) ib * 32 * x0;
+            float af[32];
+            float amax = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 32; ++k) {
+                const float val = *(const float *)(row_ptr + (size_t) k * x0);
+                af[k] = val;
+                amax = sycl::fmax(amax, sycl::fabs(val));
+            }
+            const float s = amax > 0.0f ? amax / 127.0f : 0.0f;
+            da[idx] = s;
+            const float id = s > 0.0f ? 1.0f / s : 0.0f;
+#pragma unroll
+            for (int k = 0; k < 32; ++k) {
+                const float xq = af[k] * id;
+                int q = (int)(xq + (xq >= 0.0f ? 0.5f : -0.5f));
+                if (q < -127) q = -127;
+                if (q > 127)  q = 127;
+                out[k] = (int8_t) q;
+            }
+        });
+
+        // 2a. Direct: IQ2 blocks decoded inside the DPAS kernel, no weight scratch.
+        static const bool iq2_direct = ggml_sycl_get_env("GGML_SYCL_IQ2_MOE_DIRECT", 0) != 0;
+        if (iq2_direct) {
+            static uint32_t * grid_dev[GGML_SYCL_MAX_DEVICES] = {};
+            uint32_t *& g32 = grid_dev[dev_id];
+            if (!g32) {
+                g32 = (uint32_t *) ggml_sycl_malloc_device(256 * sizeof(uint64_t), *stream);
+                stream->memcpy(g32, iq2xxs_grid, 256 * sizeof(uint64_t)).wait();
+            }
+            bool ok = true;
+            for (const auto & g : rc.groups) {
+                const int64_t base      = std::get<0>(g);
+                const int64_t batch     = std::get<1>(g);
+                const int64_t rows      = std::get<2>(g);
+                const int64_t row_start = std::get<3>(g);
+                ok = ok && ggml_sycl_iq2_moe_dpas(ctx, (const uint8_t *) win, ep + base, we, wr, g32,
+                    A + (size_t) row_start * (size_t) K, da + (size_t) row_start * (size_t) nb,
+                    yp + (size_t) row_start * (size_t) N, (int) K, (int) N, (int) rows, (int) batch);
+            }
+            GGML_ASSERT(ok && "iq2 direct moe dpas launch failed");
+        }
+        // 2b. IQ2 -> s8 [K][N] + d16 [nb][N]. Tile N by 16 so each store is contiguous.
+        for (const auto & g : (iq2_direct ? decltype(rc.groups){} : rc.groups)) {
+            const int64_t base      = std::get<0>(g);
+            const int64_t batch     = std::get<1>(g);
+            const int64_t rows      = std::get<2>(g);
+            const int64_t row_start = std::get<3>(g);
+            const int64_t ntiles    = N / 16;
+
+            stream->parallel_for(sycl::range<1>((size_t) batch * (size_t) ntiles * (size_t) nb), [=](sycl::id<1> it) {
+                const int64_t idx = (int64_t) it[0];
+                const int64_t ib  = idx % nb;
+                const int64_t nt  = (idx / nb) % ntiles;
+                const int64_t e   = idx / (nb * ntiles);
+                const int64_t n0  = nt * 16;
+                const int kb  = (int) (ib / 8);
+                const int ib8 = (int) (ib % 8);
+                int8_t tile[32][16];
+                uint16_t dtile[16];
+#pragma unroll
+                for (int t = 0; t < 16; ++t) {
+                    const int64_t row = n0 + t;
+                    const block_iq2_xxs * q = (const block_iq2_xxs *)(win + ep[base + e] * we + row * wr) + kb;
+                    const uint16_t * q2 = q->qs + 4 * ib8;
+                    const uint8_t * aux8 = (const uint8_t *) q2;
+                    const uint32_t aux32 = q2[2] | ((uint32_t) q2[3] << 16);
+                    const float d = (float) q->d * (0.5f + (float) (aux32 >> 28)) * 0.25f;
+                    dtile[t] = sycl::bit_cast<uint16_t>((sycl::half) d);
+#pragma unroll
+                    for (int il = 0; il < 4; ++il) {
+                        const int8_t * grid = (const int8_t *)(iq2xxs_grid + aux8[il]);
+                        const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * il)) & 127];
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            int v = (int) grid[j];
+                            if (signs & kmask_iq2xs[j]) {
+                                v = -v;
+                            }
+                            tile[il * 8 + j][t] = (int8_t) v;
+                        }
+                    }
+                }
+                // d16[ib][n0:n0+16]
+                uint16_t * dp = D16 + ((size_t) e * (size_t) nb + (size_t) ib) * (size_t) N + (size_t) n0;
+#pragma unroll
+                for (int t = 0; t < 16; ++t) {
+                    dp[t] = dtile[t];
+                }
+                // W8[k][n0:n0+16] for k in ib*32.. — contiguous 16-byte stores
+                int8_t * wp0 = W8 + ((size_t) e * (size_t) K + (size_t) ib * 32) * (size_t) N + (size_t) n0;
+#pragma unroll
+                for (int j = 0; j < 32; ++j) {
+                    int8_t * wp = wp0 + (size_t) j * (size_t) N;
+#pragma unroll
+                    for (int t = 0; t < 16; ++t) {
+                        wp[t] = tile[j][t];
+                    }
+                }
+            });
+
+            for (int64_t e = 0; e < batch; ++e) {
+                const int8_t * We = W8 + (size_t) e * (size_t) K * (size_t) N;
+                const uint16_t * De = D16 + (size_t) e * (size_t) nb * (size_t) N;
+                const int8_t * Ae = A + (size_t) (row_start + e * rows) * (size_t) K;
+                const float * dae = da + (size_t) (row_start + e * rows) * (size_t) nb;
+                float * Ce = yp + (size_t) (row_start + e * rows) * (size_t) N;
+                if (!ggml_sycl_xe2mx_gemm_s8(ctx, We, De, Ae, dae, Ce, K, N, rows, N)) {
+                    static int nfail = 0;
+                    if (nfail < 4) {
+                        nfail++;
+                        GGML_SYCL_XE2_LOG("iq2 moe dpas: gemm_s8 failed N=%ld M=%ld K=%ld\n",
+                                          (long) N, (long) rows, (long) K);
+                    }
+                }
+            }
+        }
+
+        stream->parallel_for(sycl::range<1>((size_t) total_padded_rows * (size_t) N), [=](sycl::id<1> it) {
+            const int64_t flat = it[0];
+            const int64_t n = flat % N;
+            const int64_t pr = flat / N;
+            const int32_t i1 = ri1[pr];
+            if (i1 >= 0) {
+                const int32_t i2 = ri2[pr];
+                *(float *)(yout + (size_t) i1 * y1 + (size_t) i2 * y2 + (size_t) n * y0) = yp[flat];
+            }
+        });
+        return;
+    }
+
+    if (use_dpas) {
+        const bool in_place_soa = (N % 16) == 0 && ggml_sycl_xe2mx_pack_moe_soa(ctx, w);
+        const int64_t nb = K / 32;
+        const size_t pitch = (size_t) nb * 16;
+        const int64_t Ndpas = in_place_soa ? N : Npad;
+        const size_t expert_w_stride = (size_t) Ndpas * pitch + (size_t) nb * (size_t) Ndpas * sizeof(uint16_t);
+        ggml_sycl_pool_alloc<int8_t> Aq(ctx.pool(), (size_t) total_padded_rows * (size_t) K);
+        ggml_sycl_pool_alloc<float> Ad(ctx.pool(), (size_t) total_padded_rows * (size_t) nb);
+        ggml_sycl_pool_alloc<uint8_t> Wsoa(ctx.pool(), in_place_soa ? 1 : (size_t) max_batch * expert_w_stride);
+        ggml_sycl_pool_alloc<float> result_pad(ctx.pool(), (Ndpas > N) ? (size_t) total_padded_rows * (size_t) Ndpas : 1);
+
+        int8_t * A = Aq.get();
+        float * da = Ad.get();
+        uint8_t * wp_soa = in_place_soa ? (uint8_t *) w->data : Wsoa.get();
+        float * yp_dpas = (Ndpas > N) ? result_pad.get() : yp;
+
+        // 1. Gather & quantize all padded rows across all groups into int8 A + float da
+        stream->parallel_for(sycl::range<1>((size_t) total_padded_rows * (size_t) nb), [=](sycl::id<1> it) {
+            const int64_t idx = (int64_t) it[0];
+            const int64_t pr = idx / nb;
+            const int64_t ib = idx % nb;
+            int8_t * out = A + (size_t) pr * (size_t) K + (size_t) ib * 32;
+            const int32_t i1 = ri1[pr];
+            if (i1 < 0) {
+                da[idx] = 0.0f;
+#pragma unroll
+                for (int k = 0; k < 32; ++k) {
+                    out[k] = 0;
+                }
+                return;
+            }
+            const int32_t i2 = ri2[pr];
+            const char * row_ptr = xin + (size_t)(i1 % channels) * x1 + (size_t) i2 * x2 + (size_t) ib * 32 * x0;
+            float af[32];
+            float amax = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 32; ++k) {
+                const float val = *(const float *)(row_ptr + (size_t) k * x0);
+                af[k] = val;
+                amax = sycl::fmax(amax, sycl::fabs(val));
+            }
+            const float s = amax > 0.0f ? amax / 127.0f : 0.0f;
+            da[idx] = s;
+            const float id = s > 0.0f ? 1.0f / s : 0.0f;
+#pragma unroll
+            for (int k = 0; k < 32; ++k) {
+                const float xq = af[k] * id;
+                int q = (int)(xq + (xq >= 0.0f ? 0.5f : -0.5f));
+                if (q < -127) q = -127;
+                if (q > 127)  q = 127;
+                out[k] = (int8_t) q;
+            }
+        });
+
+        // 2. Per-group ESIMD s4 x s8 DPAS (zero weight repack when in_place_soa is active)
+        for (const auto & g : rc.groups) {
+            const int64_t base      = std::get<0>(g);
+            const int64_t batch     = std::get<1>(g);
+            const int64_t rows      = std::get<2>(g);
+            const int64_t row_start = std::get<3>(g);
+
+            if (!in_place_soa) {
+                stream->parallel_for(sycl::range<1>((size_t) batch * (size_t) Ndpas * (size_t) nb * 4), [=](sycl::id<1> it) {
+                    const int64_t idx = (int64_t) it[0];
+                    const int64_t j4  = idx & 3;
+                    const int64_t b   = idx >> 2;
+                    const int64_t kb  = b % nb;
+                    const int64_t row = (b / nb) % Ndpas;
+                    const int64_t e   = b / (nb * Ndpas);
+                    uint8_t * dst_e = wp_soa + (size_t) e * expert_w_stride;
+                    if (row >= N) {
+                        if (j4 == 0) {
+                            uint16_t * d16 = (uint16_t *)(dst_e + (size_t) Ndpas * pitch);
+                            d16[(size_t) kb * (size_t) Ndpas + (size_t) row] = 0;
+                        }
+                        uint32_t * qs32 = (uint32_t *)(dst_e + (size_t) row * pitch + (size_t) kb * 16);
+                        qs32[j4] = 0u;
+                        return;
+                    }
+                    const uint8_t * blk = (const uint8_t *)(win + ep[base + e] * we + row * wr) + kb * 18;
+                    if (j4 == 0) {
+                        uint16_t * d16 = (uint16_t *)(dst_e + (size_t) Ndpas * pitch);
+                        uint16_t dval;
+                        memcpy(&dval, blk, sizeof(uint16_t));
+                        d16[(size_t) kb * (size_t) Ndpas + (size_t) row] = dval;
+                    }
+                    uint32_t qv;
+                    memcpy(&qv, blk + 2 + j4 * 4, sizeof(uint32_t));
+                    uint32_t * qs32 = (uint32_t *)(dst_e + (size_t) row * pitch + (size_t) kb * 16);
+                    qs32[j4] = qv;
+                });
+            }
+
+            ggml_sycl_xe2mx_moe_dpas(ctx,
+                wp_soa,
+                in_place_soa ? (ep + base) : nullptr,
+                A + (size_t) row_start * (size_t) K,
+                da + (size_t) row_start * (size_t) nb,
+                yp_dpas + (size_t) row_start * (size_t) Ndpas,
+                (int) K, (int) Ndpas, (int) rows, (int) batch);
+        }
+
+        if (Ndpas > N) {
+            stream->parallel_for(sycl::range<1>((size_t) total_padded_rows * (size_t) N), [=](sycl::id<1> it) {
+                const int64_t flat = it[0];
+                const int64_t n = flat % N;
+                const int64_t pr = flat / N;
+                const int32_t i1 = ri1[pr];
+                if (i1 >= 0) {
+                    const int32_t i2 = ri2[pr];
+                    *(float *)(yout + (size_t) i1 * y1 + (size_t) i2 * y2 + (size_t) n * y0) = yp_dpas[pr * Ndpas + n];
+                }
+            });
+            return;
+        }
+    } else {
+        ggml_sycl_pool_alloc<sycl::half> gathered(ctx.pool(), total_padded_rows * K);
+        ggml_sycl_pool_alloc<sycl::half> weights(ctx.pool(), max_batch * K * N);
+        sycl::half * xp = gathered.get();
+        sycl::half * wp = weights.get();
+
+        // 1. Single kernel launch to gather all padded rows across all groups into xp
+        stream->parallel_for(sycl::range<1>((size_t) total_padded_rows * (size_t) K), [=](sycl::id<1> it) {
+            const int64_t flat = it[0];
+            const int64_t k = flat % K;
+            const int64_t pr = flat / K;
+            const int32_t i1 = ri1[pr];
+            sycl::half v = 0;
+            if (i1 >= 0) {
+                const int32_t i2 = ri2[pr];
+                v = (sycl::half) *(const float *)(xin + (i1 % channels) * x1 + (size_t) i2 * x2 + (size_t) k * x0);
+            }
+            xp[flat] = v;
+        });
+
+        // 2. Per-group expert -> FP16 dequant + cached oneDNN batched GEMM
+        sycl::half2 * wp2 = reinterpret_cast<sycl::half2 *>(wp);
+        const bool iq2 = w->type == GGML_TYPE_IQ2_XXS;
+        for (const auto & g : rc.groups) {
+            const int64_t base      = std::get<0>(g);
+            const int64_t batch     = std::get<1>(g);
+            const int64_t rows      = std::get<2>(g);
+            const int64_t row_start = std::get<3>(g);
+
+            if (iq2) {
+                // one 32-lane work-group per 256-weight block, same math as dequantize_block_iq2_xxs
+                const int64_t nbk = K / QK_K;
+                stream->parallel_for(
+                    sycl::nd_range<1>(sycl::range<1>((size_t) batch * (size_t) N * (size_t) nbk * 32), sycl::range<1>(32)),
+                    [=](sycl::nd_item<1> it) {
+                        const int64_t b   = (int64_t) it.get_group(0);
+                        const int     tid = (int) it.get_local_id(0);
+                        const int64_t kb  = b % nbk;
+                        const int64_t row = (b / nbk) % N;
+                        const int64_t e   = b / (nbk * N);
+                        const block_iq2_xxs * q = (const block_iq2_xxs *)(win + ep[base + e] * we + row * wr) + kb;
+                        const int il = tid / 8;
+                        const int ib = tid % 8;
+                        const uint16_t * q2 = q->qs + 4 * ib;
+                        const uint8_t * aux8 = (const uint8_t *) q2;
+                        const uint8_t * grid = (const uint8_t *)(iq2xxs_grid + aux8[il]);
+                        const uint32_t aux32 = q2[2] | ((uint32_t) q2[3] << 16);
+                        const float d = (float) q->d * (0.5f + (float) (aux32 >> 28)) * 0.25f;
+                        const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
+                        sycl::half * y = wp + ((size_t) e * (size_t) N + (size_t) row) * (size_t) K + (size_t) kb * QK_K + 32 * ib + 8 * il;
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            y[j] = (sycl::half) (d * grid[j] * ((signs & kmask_iq2xs[j]) ? -1.f : 1.f));
+                        }
+                    });
+            } else {
+                stream->parallel_for(sycl::range<1>((size_t) batch * (size_t) N * (size_t) (K / 2)), [=](sycl::id<1> it) {
+                    const int64_t idx = it[0];
+                    const int64_t j = idx & 15;
+                    const int64_t b = idx >> 4;
+                    const int64_t kb = b % (K / 32);
+                    const int64_t row = (b / (K / 32)) % N;
+                    const int64_t e = b / (K * N / 32);
+                    const block_xe2mx4 * q = (const block_xe2mx4 *)(win + ep[base + e] * we + row * wr) + kb;
+                    const float d = (float) q->d;
+                    const uint8_t v = q->qs[j];
+                    wp2[idx] = sycl::half2((sycl::half)(((int)(v & 15) - 8) * d),
+                                           (sycl::half)(((int)(v >> 4) - 8) * d));
+                });
+            }
+
+            DnnlGemmWrapper::gemm(ctx, (int) N, (int) rows, (int) K,
+                wp, DnnlGemmWrapper::to_dt<sycl::half>(), 1, K, N * K,
+                xp + row_start * K, DnnlGemmWrapper::to_dt<sycl::half>(), 1, K, rows * K,
+                yp + row_start * N, DnnlGemmWrapper::to_dt<float>(), stream, batch, batch);
+        }
+    }
+
+    // 3. Single kernel launch to scatter all valid rows from yp into yout
+    stream->parallel_for(sycl::range<1>((size_t) total_padded_rows * (size_t) N), [=](sycl::id<1> it) {
+        const int64_t flat = it[0];
+        const int64_t n = flat % N;
+        const int64_t pr = flat / N;
+        const int32_t i1 = ri1[pr];
+        if (i1 >= 0) {
+            const int32_t i2 = ri2[pr];
+            *(float *)(yout + (size_t) i1 * y1 + (size_t) i2 * y2 + (size_t) n * y0) = yp[flat];
+        }
+    });
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                  ggml_tensor *dst) try {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
     const ggml_tensor *src0 = dst->src[0];
     const ggml_tensor *src1 = dst->src[1];
+    if (src0->type == GGML_TYPE_IQ2_XXS && src1->ne[2] > 8 && (src0->ne[0] % QK_K) == 0 &&
+        src1->type == GGML_TYPE_F32 &&
+        ggml_sycl_get_env("GGML_SYCL_IQ2_MOE_DPAS", 0)) {
+        ggml_sycl_mul_mat_id_xe2mx_prefill(ctx, dst);
+        return;
+    }
+    if (src0->type == GGML_TYPE_XE2MX4) {
+        // 8 rows or fewer (decode, speculative verify) stay on DP4A, which is faster there
+        if (src1->ne[2] > 8 && ggml_sycl_get_env("GGML_SYCL_XE2MX_MOE_GEMM", 0)) {
+            ggml_sycl_mul_mat_id_xe2mx_prefill(ctx, dst);
+            return;
+        }
+        if (ggml_sycl_get_env("GGML_SYCL_XE2MX_MOE_DP4A", 0) &&
+            ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, dst->src[2], dst)) {
+            return;
+        }
+        ggml_sycl_mul_mat_id_xe2mx_native(ctx, dst);
+        return;
+    }
     if (ggml_is_exl3(src0->type)) {
         GGML_ABORT("EXL3 mul_mat_id is CUDA-only (packed expert tiles); SYCL has no MoE EXL3 path");
     }
@@ -5921,7 +6844,7 @@ catch (sycl::exception const &exc) {
 static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {
     if (!g_sycl_loaded) return false;
     initialize_sycl_begining();
-    xe2mx_scratch_bind(ctx.device);
+    xe2mx_scratch_bind(ctx.device, true);
 
     if (dst->src[0] != nullptr && ggml_backend_buffer_is_sycl_split(dst->src[0]->buffer)) {
         ggml_sycl_set_peer_access(dst->src[1]->ne[1], ctx.device);
@@ -6564,6 +7487,149 @@ static void ggml_sycl_gr_use_build(const ggml_cgraph * cgraph) {
     g_sycl_gr_use_graph = cgraph;
 }
 
+
+// Bolt Mamba-2: concat(state, transpose(xBC view)) -> ssm_conv -> add(bias) -> silu, with xBC a strided view.
+// Writes only the last 64 concat columns (the conv-state CPY reads the last 3) and the silu output.
+static const ggml_tensor * g_bolt_conv_done[256];
+static int g_bolt_conv_done_n = 0;
+
+static bool ggml_sycl_bolt_conv_skip(const ggml_tensor * node) {
+    for (int k = 0; k < g_bolt_conv_done_n; ++k) {
+        if (g_bolt_conv_done[k] == node) {
+            g_bolt_conv_done[k] = nullptr;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_sycl_try_bolt_conv(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    static const int on = ggml_sycl_get_env("GGML_SYCL_BOLT_CONV", 0);
+    ggml_tensor * cc = cgraph->nodes[i];
+    if (!on || cc->op != GGML_OP_CONCAT || cc->type != GGML_TYPE_F32 || ((const int32_t *) cc->op_params)[0] != 0) {
+        return false;
+    }
+    const ggml_tensor * st = cc->src[0];
+    const ggml_tensor * x  = cc->src[1];
+    static int ndbg = 0;
+    if (ndbg++ < 1 && st && x) {
+        GGML_SYCL_XE2_LOG("bolt conv probe st ne=%ld,%ld,%ld nb=%zu,%zu x ne=%ld,%ld,%ld,%ld nb=%zu,%zu,%zu xdata%%16=%zu cc_cont=%d st_cont=%d\n",
+            (long) st->ne[0], (long) st->ne[1], (long) st->ne[2], st->nb[0], st->nb[1], (long) x->ne[0], (long) x->ne[1], (long) x->ne[2], (long) x->ne[3],
+            x->nb[0], x->nb[1], x->nb[2], (size_t) (((uintptr_t) x->data) % 16), (int) ggml_is_contiguous(cc), (int) ggml_is_contiguous(st));
+        fflush(stderr);
+    }
+    if (!st || !x || st->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || st->ne[0] != 3 ||
+        !ggml_is_contiguous(st) || !ggml_is_contiguous(cc) || x->nb[1] != sizeof(float) ||
+        (x->nb[0] % 16) != 0 || x->ne[1] != st->ne[1] || x->ne[2] != st->ne[2] || x->ne[3] != 1 ||
+        (st->ne[1] % 4) != 0 || (((uintptr_t) x->data) % 16) != 0) {
+        return false;
+    }
+    ggml_tensor * conv = nullptr; ggml_tensor * add = nullptr; ggml_tensor * silu = nullptr;
+    int jc = -1;
+    for (int j = i + 1; j < cgraph->n_nodes && j < i + 64; ++j) {
+        if (cgraph->nodes[j]->op == GGML_OP_SSM_CONV && cgraph->nodes[j]->src[0] == cc) { conv = cgraph->nodes[j]; jc = j; break; }
+    }
+    if (ndbg < 3) {
+        ndbg++;
+        for (int j = i + 1; j < cgraph->n_nodes && j < i + 8; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            GGML_SYCL_XE2_LOG("  bolt conv seq %d %s %s src0=%s\n", j - i, ggml_op_desc(n), n->name, n->src[0] ? n->src[0]->name : "-");
+        }
+        fflush(stderr);
+    }
+    if (!conv || jc + 2 >= cgraph->n_nodes) return false;
+    {
+        const int ncs_chk = 3 + (int) x->ne[0];
+        const int keep_chk = ncs_chk < 64 ? ncs_chk : 64;
+        for (int j = i + 1; j < jc; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (n->op == GGML_OP_VIEW && n->view_src == cc) {
+                const int col0 = (int) ((n->view_offs % cc->nb[1]) / sizeof(float));
+                if (n->ne[0] > 3 || col0 < ncs_chk - keep_chk || n->nb[1] != cc->nb[1]) return false;
+            } else if (n->op != GGML_OP_VIEW && n->op != GGML_OP_CPY && n->op != GGML_OP_RESHAPE) {
+                for (int k = 0; k < GGML_MAX_SRC; ++k) if (n->src[k] == cc) return false;
+            }
+        }
+    }
+    add = cgraph->nodes[jc + 1]; silu = cgraph->nodes[jc + 2];
+    if (add->op != GGML_OP_ADD || add->src[0] != conv || silu->op != GGML_OP_UNARY ||
+        ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || silu->src[0] != add) return false;
+    const ggml_tensor * w = conv->src[1];
+    const ggml_tensor * bias = add->src[1];
+    if (w->type != GGML_TYPE_F32 || w->ne[0] != 4 || !ggml_is_contiguous(w) || bias->type != GGML_TYPE_F32 ||
+        ggml_nelements(bias) != st->ne[1] || !ggml_is_contiguous(silu) || !ggml_is_contiguous(conv)) return false;
+    if (g_bolt_conv_done_n + 3 > 256) return false;
+
+    const int C = (int) st->ne[1];
+    const int n_t = (int) x->ne[0];
+    const int n_s = (int) st->ne[2];
+    const int ncs = 3 + n_t;
+    const size_t xt = x->nb[0] / sizeof(float);
+    const size_t xs = x->nb[2] / sizeof(float);
+    const float * sp = (const float *) st->data;
+    const float * xp = (const float *) x->data;
+    const float * wp = (const float *) w->data;
+    const float * bp = (const float *) bias->data;
+    float * cp = (float *) cc->data;
+    float * yp = (float *) silu->data;
+    queue_ptr q = ctx.stream();
+    const int n_keep = ncs < 64 ? ncs : 64;
+    const int tok0 = ncs - n_keep;
+    q->parallel_for(sycl::range<1>((size_t) n_s * C * n_keep), [=](sycl::id<1> id) {
+        size_t idx = id[0];
+        const int tl = (int) (idx % n_keep); idx /= n_keep;
+        const int c = (int) (idx % C);
+        const int s = (int) (idx / C);
+        const int k = tok0 + tl;
+        const float v = k < 3 ? sp[(size_t) s * 3 * C + (size_t) c * 3 + k]
+                              : xp[(size_t) s * xs + (size_t) (k - 3) * xt + c];
+        cp[(size_t) s * ncs * C + (size_t) c * ncs + k] = v;
+    });
+    constexpr int TOK = 64;
+    const int n_c4 = C / 4;
+    const int n_tb = (n_t + TOK - 1) / TOK;
+    const size_t tot = (size_t) n_c4 * n_tb * n_s;
+    q->parallel_for(sycl::nd_range<1>(sycl::range<1>((tot + 255) / 256 * 256), sycl::range<1>(256)), [=](sycl::nd_item<1> it) {
+        const size_t idx = it.get_global_id(0);
+        if (idx >= tot) return;
+        const int c = (int) (idx % n_c4) * 4;
+        const int tb = (int) ((idx / n_c4) % n_tb);
+        const int s = (int) (idx / ((size_t) n_c4 * n_tb));
+        const int t0 = tb * TOK;
+        const int t1 = t0 + TOK < n_t ? t0 + TOK : n_t;
+        auto ld = [&](int k) -> sycl::float4 {
+            if (k < 3) {
+                const float * b = sp + (size_t) s * 3 * C;
+                return sycl::float4(b[(c + 0) * 3 + k], b[(c + 1) * 3 + k], b[(c + 2) * 3 + k], b[(c + 3) * 3 + k]);
+            }
+            return *reinterpret_cast<const sycl::float4 *>(xp + (size_t) s * xs + (size_t) (k - 3) * xt + c);
+        };
+        sycl::float4 wv[4];
+#pragma unroll
+        for (int r = 0; r < 4; ++r) wv[r] = *reinterpret_cast<const sycl::float4 *>(wp + (size_t) (c + r) * 4);
+        const sycl::float4 w0(wv[0].x(), wv[1].x(), wv[2].x(), wv[3].x());
+        const sycl::float4 w1(wv[0].y(), wv[1].y(), wv[2].y(), wv[3].y());
+        const sycl::float4 w2(wv[0].z(), wv[1].z(), wv[2].z(), wv[3].z());
+        const sycl::float4 w3(wv[0].w(), wv[1].w(), wv[2].w(), wv[3].w());
+        const sycl::float4 bb = *reinterpret_cast<const sycl::float4 *>(bp + c);
+        sycl::float4 x0 = ld(t0), x1 = ld(t0 + 1), x2 = ld(t0 + 2);
+        float * yb = yp + (size_t) s * C * n_t;
+        for (int t = t0; t < t1; ++t) {
+            const sycl::float4 x3 = ld(t + 3);
+            sycl::float4 v = x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3 + bb;
+            v = v / (1.0f + sycl::native::exp(-v));
+            *reinterpret_cast<sycl::float4 *>(yb + (size_t) t * C + c) = v;
+            x0 = x1; x1 = x2; x2 = x3;
+        }
+    });
+    g_bolt_conv_done[g_bolt_conv_done_n++] = conv;
+    g_bolt_conv_done[g_bolt_conv_done_n++] = add;
+    g_bolt_conv_done[g_bolt_conv_done_n++] = silu;
+    static int nlog = 0;
+    if (nlog++ < 2) { GGML_SYCL_XE2_LOG("bolt conv fuse %s C=%d n_t=%d xt=%zu\n", cc->name, C, n_t, xt); fflush(stderr); }
+    return true;
+}
+
 static bool ggml_sycl_skip_gdn_state_rows(const ggml_cgraph * cgraph, int node_idx) {
     const int skipgr = ggml_sycl_get_env("GGML_SYCL_SKIPGR", 1);
     const int skipconv = ggml_sycl_get_env("GGML_SYCL_SKIPCONV", 0);
@@ -6856,6 +7922,8 @@ struct xe2mx_gtime_scope {
     }
 };
 
+#include "bolt-tail.hpp"
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
     ggml_sycl_env_cache_enable();
@@ -6929,7 +7997,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         // count every per-device graph call; load + two prefill graphs cover ~260
         // calls per device, so 262..320 lands inside the first decode token
         const int igr = n_tp_seen_d[sycl_ctx->device]++;
-        if (igr >= 262 && igr < 320) {
+        if (igr >= 30 && igr < 90) {
             opt_this = 1;
         }
     }
@@ -6965,8 +8033,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     }
 
     ggml_sycl_conv_concat_fuse_begin();
+    g_bolt_conv_done_n = 0;
+    // fused XE2MX paths below bypass compute_forward; bind this device's scratch first
+    xe2mx_scratch_bind(sycl_ctx->device);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        xe2mx_scratch_bind(sycl_ctx->device);
         if (ggml_sycl_is_view_or_noop(node)) {
             continue;
         }
@@ -7019,7 +8091,21 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 #endif
-        if (node->op == GGML_OP_CONCAT && ggml_sycl_try_conv_concat_fuse(*sycl_ctx, cgraph, i)) {
+        static const int lab_no_conv_fuse = ggml_sycl_get_env("XE2_LAB_NO_CONV_FUSE", 0);
+        // XE2_LAB_NO_CONV_FUSE: 1 = never fuse; 2 = auto, skip only deep-rollback verify batches (DFlash2 block,
+        // 3..64 tokens: the fused path corrupts it); cheap-MTP verify (<= 2) and prefill keep the fusion
+        bool conv_fuse_off = lab_no_conv_fuse == 1;
+        if (lab_no_conv_fuse == 2 && node->op == GGML_OP_CONCAT && node->src[0] && node->src[1]) {
+            const int64_t n_tok = node->ne[0] - node->src[0]->ne[0];
+            conv_fuse_off = n_tok > 2 && n_tok <= 64;
+        }
+        if (g_bolt_conv_done_n > 0 && ggml_sycl_bolt_conv_skip(node)) {
+            continue;
+        }
+        if (node->op == GGML_OP_CONCAT && ggml_sycl_try_bolt_conv(*sycl_ctx, cgraph, i)) {
+            continue;
+        }
+        if (!conv_fuse_off && node->op == GGML_OP_CONCAT && ggml_sycl_try_conv_concat_fuse(*sycl_ctx, cgraph, i)) {
             continue;
         }
         if (node->op == GGML_OP_SSM_CONV) {
@@ -7039,6 +8125,49 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             if (gdn_nodes_to_skip > 0) {
                 ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy);
                 i += gdn_nodes_to_skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_CONT) {
+            const int tail = ggml_sycl_try_bolt_tail(*sycl_ctx, cgraph, i);
+            if (tail) { i += tail - 1; continue; }
+        }
+        if (ggml_sycl_get_env("GGML_SYCL_BOLT_EXPERT_SUM", 0) && node->op == GGML_OP_ADD &&
+            i + 7 < cgraph->n_nodes &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD,
+                                          GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD }, { i + 7 })) {
+            bool valid = true;
+            struct sum_inputs { const float * p[9]; } inputs{};
+            const int64_t n0 = node->ne[0], n1 = node->ne[1];
+            size_t strides[9] = {};
+            inputs.p[0] = (const float *) node->src[0]->data;
+            strides[0] = node->src[0]->nb[1] / sizeof(float);
+            for (int k = 0; k < 8; ++k) {
+                ggml_tensor * a = cgraph->nodes[i + k];
+                const ggml_tensor * s = a->src[1];
+                valid = valid && a->type == GGML_TYPE_F32 && s->type == GGML_TYPE_F32 &&
+                    a->ne[0] == n0 && a->ne[1] == n1 && a->ne[2] == 1 && a->ne[3] == 1 &&
+                    s->ne[0] == n0 && s->ne[1] == n1 && s->nb[0] == sizeof(float) &&
+                    (k == 0 || a->src[0] == cgraph->nodes[i + k - 1]);
+                inputs.p[k + 1] = (const float *) s->data;
+                strides[k + 1] = s->nb[1] / sizeof(float);
+            }
+            ggml_tensor * last = cgraph->nodes[i + 7];
+            valid = valid && node->src[0]->type == GGML_TYPE_F32 &&
+                node->src[0]->nb[0] == sizeof(float) && ggml_is_contiguous(last);
+            if (valid) {
+                static int nsum = 0;
+                if (nsum++ < 2) { GGML_SYCL_XE2_LOG("bolt expert-sum bind %s\n", last->name); fflush(stderr); }
+                struct sum_strides { size_t s[9]; } st{};
+                for (int k = 0; k < 9; ++k) st.s[k] = strides[k];
+                float * y = (float *) last->data;
+                sycl_ctx->stream()->parallel_for(sycl::range<1>(n0 * n1), [=](sycl::id<1> id) {
+                    const size_t col = id[0] % n0, row = id[0] / n0;
+                    float v = inputs.p[0][row * st.s[0] + col];
+                    for (int k = 1; k < 9; ++k) v += inputs.p[k][row * st.s[k] + col];
+                    y[id] = v;
+                });
+                i += 7;
                 continue;
             }
         }
@@ -7126,6 +8255,22 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             ggml_tensor * un = cgraph->nodes[i + 1];
             ggml_sycl_unary_from(*sycl_ctx, un, node->src[0]);
             i++;
+            continue;
+        }
+        if (ggml_sycl_get_env("GGML_SYCL_BOLT_RELU_SQR", 0) &&
+            node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_RELU &&
+            i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_SQR &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_UNARY, GGML_OP_SQR }, { i + 1 }) &&
+            node->src[0]->type == GGML_TYPE_F32 && cgraph->nodes[i + 1]->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(cgraph->nodes[i + 1])) {
+            const float * x = (const float *) node->src[0]->data;
+            float * y = (float *) cgraph->nodes[i + 1]->data;
+            const size_t n = ggml_nelements(cgraph->nodes[i + 1]);
+            sycl_ctx->stream()->parallel_for(sycl::range<1>(n), [=](sycl::id<1> j) {
+                const float v = x[j];
+                y[j] = v > 0.0f ? v * v : 0.0f;
+            });
+            ++i;
             continue;
         }
         if (node->op == GGML_OP_L2_NORM && ggml_sycl_skip_gdn_l2(cgraph, i)) {
@@ -7336,6 +8481,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 dump_op(GGML_OP_ADD, "ADD", 16);
                 dump_op(GGML_OP_UNARY, "UNARY", 12);
                 dump_op(GGML_OP_CONCAT, "CONCAT", 8);
+                dump_op(GGML_OP_MUL, "MUL", 12);
                 dump_op(GGML_OP_CONT, "CONT", 8);
                 dump_op(GGML_OP_RMS_NORM, "RMS", 8);
                 dump_op(GGML_OP_L2_NORM, "L2", 8);
@@ -7407,7 +8553,8 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
 }
 #endif
 
-static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+
+static enum ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
 
 #ifdef GGML_SYCL_GRAPH
@@ -7418,6 +8565,15 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         static int nskip = 0;
         if (nskip++ < 3) {
             GGML_SYCL_XE2_LOG( "sycl-graph: ENABLE_GRAPH is 0\n");
+        }
+    }
+    if (use_sycl_graph && !sycl_ctx->moe_q8) {
+        // The fused MoE matvec allocates its q8 scratch on first use; never do that while recording
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i] && cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
+                use_sycl_graph = false;
+                break;
+            }
         }
     }
     if (use_sycl_graph) {
@@ -7458,8 +8614,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             return GGML_STATUS_SUCCESS;
         }
 
-        // Record every step. Replaying the same executable hung the draft queue on
-        // this runtime, so there is no replay cache.
+        // Record every step; executable graph replay is not supported here.
         {
             GGML_SYCL_XE2_LOG("sycl-graph: record decode nodes=%d\n", cgraph->n_nodes);
         }
@@ -7522,6 +8677,8 @@ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_ev
     sycl::event* sycl_event = static_cast<sycl::event*>(event->context);
 
     if (ggml_backend_is_sycl(backend)) {
+        // Wait on the recorded event rather than draining the destination queue.
+        // A queue wait here serializes independent work already submitted to that device.
         SYCL_CHECK(CHECK_TRY_ERROR(sycl_event->wait()));
     } else
         GGML_ABORT("fatal error");
@@ -7726,6 +8883,16 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 if (!ggml_is_permuted(a) && ggml_is_permuted(b) && b->ne[2] > 1 && b->ne[3] > 1 &&
                     a->ne[0] > 128 && a->ne[2] == 1 && src0_type == GGML_TYPE_F16) {
                     return false;
+                }
+
+                if (src0_type == GGML_TYPE_XE2MX4 && op->op == GGML_OP_MUL_MAT_ID) {
+                    const ggml_tensor * ids = op->src[2];
+                    return ggml_sycl_is_xe2_dgpu(ggml_sycl_info().devices[device].hw_info.arch) &&
+                           (!a->buffer || !ggml_backend_buffer_is_sycl_split(a->buffer)) &&
+                           a->ne[3] == 1 && b->ne[3] == 1 && b->type == GGML_TYPE_F32 &&
+                           op->type == GGML_TYPE_F32 && ids && ids->type == GGML_TYPE_I32 &&
+                           a->ne[0] == b->ne[0] && a->ne[0] % QK_XE2MX4 == 0 &&
+                           (b->ne[1] == 1 || b->ne[1] == ids->ne[0]) && b->ne[2] == ids->ne[1];
                 }
 
                 if (src0_type == GGML_TYPE_TQ2_0) {
@@ -8236,6 +9403,31 @@ struct ggml_backend_sycl_comm_context {
     std::unique_ptr<ggml_sycl_pool_alloc<uint8_t>> buf0;
     std::unique_ptr<ggml_sycl_pool_alloc<uint8_t>> buf1;
     int64_t buf_nelem = 0;
+    struct state_copy { void * dst; const void * src; size_t bytes; };
+    std::vector<state_copy> pending_state;
+    struct peer_weight {
+        const void * source; void * resident; size_t bytes;
+        std::unique_ptr<ggml_tensor> tensor;
+        std::unique_ptr<ggml_tensor_extra_gpu> extra;
+    };
+    std::vector<peer_weight> peer_ffn;
+    bool peer_ffn_ready = false;
+    // LAYEROWN: full-width FFN weights for each card's owned layers, owner-written KV/state slices
+    struct own_copy { void * dst; const void * src; size_t bytes; int from; size_t row_bytes = 0; int64_t rows = 0; };
+    struct own_storage {
+        std::unordered_map<std::string, peer_weight> full[2];
+        std::vector<own_copy> pending;
+        bool preloaded = false;
+        // causal-contiguous valid KV length seen by this request's owned FA nodes (op_params[5]); KV rows >= it are empty
+        int32_t kv_valid = 0;
+        int64_t kv_cells = 0;
+        bool    kv_valid_bad = false;
+    };
+    std::shared_ptr<own_storage> own = std::make_shared<own_storage>();
+    // per-slot scratch so pipelined slots do not alias the same device buffers
+    void * own_tmp[2][3] = {};
+    size_t own_tmp_cap[2] = {};
+    char * own_bounce = nullptr;
 };
 
 void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends) try {
@@ -8262,6 +9454,19 @@ void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends)
 catch (const sycl::exception &) { return nullptr; }
 catch (...)                     { return nullptr; }
 
+static bool ggml_backend_sycl_comm_share_owner(void * src, void * dst) {
+    auto * a = (ggml_backend_sycl_comm_context *) src;
+    auto * b = (ggml_backend_sycl_comm_context *) dst;
+    if (!a || !b || !b->own->full[0].empty() || !b->own->full[1].empty()) return false;
+    for (int c = 0; c < 2; ++c) {
+        auto * ca = (ggml_backend_sycl_context *) a->backends[c]->context;
+        auto * cb = (ggml_backend_sycl_context *) b->backends[c]->context;
+        if (ca->device != cb->device || ca->stream() != cb->stream()) return false;
+    }
+    b->own = a->own;
+    return true;
+}
+
 void ggml_backend_sycl_comm_free(void * comm_ctx_v) {
     auto * comm_ctx = static_cast<ggml_backend_sycl_comm_context *>(comm_ctx_v);
     if (comm_ctx == nullptr) {
@@ -8276,6 +9481,24 @@ void ggml_backend_sycl_comm_free(void * comm_ctx_v) {
         try {
             sctx0->stream()->wait();
             sctx1->stream()->wait();
+            for (const auto & w : comm_ctx->peer_ffn) sycl::free(w.resident, *sctx0->stream());
+            comm_ctx->peer_ffn.clear();
+            ggml_backend_sycl_context * owners[2] = { sctx0, sctx1 };
+            for (int c = 0; c < 2; ++c) {
+                if (comm_ctx->own.use_count() == 1) {
+                    for (const auto & entry : comm_ctx->own->full[c]) {
+                        sycl::free(entry.second.resident, *owners[c]->stream());
+                    }
+                    comm_ctx->own->full[c].clear();
+                }
+                for (auto & p : comm_ctx->own_tmp[c]) {
+                    if (p) sycl::free(p, *owners[c]->stream());
+                    p = nullptr;
+                }
+                comm_ctx->own_tmp_cap[c] = 0;
+            }
+            if (comm_ctx->own_bounce) sycl::free(comm_ctx->own_bounce, *sctx0->stream());
+            if (comm_ctx->own.use_count() == 1) comm_ctx->own->pending.clear();
         } catch (...) { /* best effort during shutdown */ }
     }
 
@@ -8832,7 +10055,7 @@ bool ggml_backend_sycl_comm_graph_compute(void * comm_ctx_v, struct ggml_cgraph 
     return true;
 }
 catch (const sycl::exception &) { return false; }
-catch (...)                     { return false; }
+catch (...)                     { GGML_ABORT("TP executor failed with an unknown exception"); }
 
 static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, const char *name) {
     GGML_UNUSED(reg);
@@ -8844,6 +10067,9 @@ static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, cons
     // Tensor parallelism (--split-mode tensor) entry points.
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_sycl_comm_init;
+    }
+    if (strcmp(name, "ggml_backend_comm_share_owner") == 0) {
+        return (void *) ggml_backend_sycl_comm_share_owner;
     }
     if (strcmp(name, "ggml_backend_comm_free") == 0) {
         return (void *)ggml_backend_sycl_comm_free;

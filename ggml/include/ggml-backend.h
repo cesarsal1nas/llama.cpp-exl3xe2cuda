@@ -361,6 +361,12 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+    // called on the submitting thread before each split's inputs are copied (NULL to clear)
+    typedef void (*ggml_backend_sched_split_hook)(void * user_data, int split_id, ggml_backend_t backend);
+    GGML_API void                 ggml_backend_sched_set_split_hook(ggml_backend_sched_t sched, ggml_backend_sched_split_hook hook, void * user_data);
+    // global submission lock used when LLAMA_XE2_PREFILL_THREAD=1 (no-op otherwise)
+    GGML_API void                 ggml_backend_prefill_submit_lock(void);
+    GGML_API void                 ggml_backend_prefill_submit_unlock(void);
 
     //
     // Meta backend

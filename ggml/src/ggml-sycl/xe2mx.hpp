@@ -9,9 +9,10 @@ void ggml_sycl_mul_mat_xe2mx(ggml_backend_sycl_context & ctx,
                               ggml_tensor * dst);
 
 // Activation scratch is one slot. A second SYCL device must not reuse it.
-void xe2mx_scratch_bind(int device);
+void xe2mx_scratch_bind(int device, bool force = false);
 
 void ggml_sycl_xe2mx_graph_begin();
+void ggml_sycl_xe2mx_ffn_role_bind(const ggml_tensor * tensor);
 // Size MG defer slots and drop host LO packs before SYCL begin_recording.
 // The waits in mg_run are alloc-only; they are illegal on a recording queue.
 void ggml_sycl_xe2mx_graph_record_prepare(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph);

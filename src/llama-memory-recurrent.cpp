@@ -34,6 +34,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+    rs_valid.assign(n_seq_max, n_rs_seq);
 
     cells.clear();
     cells.resize(mem_size);
@@ -195,7 +196,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                const bool ok = !pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq &&
+                                rollback <= (llama_pos) rs_valid[seq_id];
+                if (ok) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
@@ -442,7 +445,9 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
                 //   so that the rollback snapshots remain valid
-                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                // Prefill writes at most llama_rs_prefill_k snapshots; only those trailing tokens
+                // must stay in one ubatch.
+                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? (uint32_t) llama_rs_prefill_k(n_rs_seq + 1) : 0);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -505,6 +510,14 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
 bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
+
+    if (n_rs_seq > 0) {
+        const uint32_t n_wr = (uint32_t) llama_rs_snapshots_written(n_seq_tokens, (int64_t) n_rs_seq + 1);
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            const llama_seq_id sid = ubatch.seq_id_unq[s];
+            if (sid >= 0 && (size_t) sid < rs_valid.size()) rs_valid[sid] = n_wr - 1;
+        }
+    }
 
     // if we have enough unused cells before the current head ->
     //   better to start searching from the beginning of the cache, hoping to fill it

@@ -833,9 +833,13 @@ struct llm_graph_params {
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
+    // lab: false when this ubatch hands no layer inputs to a drafter (keeps them out of the graph outputs)
+    bool layer_inp_out = true;
+
     bool allow_reuse(const llm_graph_params & other) const {
         // first check the ubatch
         bool can_reuse_ubatch =
+            layer_inp_out == other.layer_inp_out &&
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
             ubatch.n_tokens     == other.ubatch.n_tokens &&
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
@@ -950,6 +954,8 @@ public:
 
     void add_fused_node(llm_graph_fused_node result);
 
+    void add_fa_mask(ggml_tensor * fa, ggml_tensor * mask_root) { fa_masks.emplace_back(fa, mask_root); }
+
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
     void set_params(const llm_graph_params & params);
@@ -971,6 +977,7 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> fa_masks;
 
     ggml_context_ptr ctx_compute;
 
