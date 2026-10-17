@@ -554,8 +554,11 @@ struct server_slot {
 
             // Hybrid/recurrent models cannot roll a reused slot back to a clean prompt.
             // Keeping the previous answer in the slot makes the next request sample EOS.
+            // XE2_KEEP_HYBRID_SLOT=1 keeps the slot so context checkpoints can be reused
+            // on the next turn (test only until the EOS case is ruled out).
+            static const bool keep_hybrid = getenv("XE2_KEEP_HYBRID_SLOT") && atoi(getenv("XE2_KEEP_HYBRID_SLOT")) == 1;
             const llama_model * mdl = llama_get_model(ctx_tgt);
-            if (task->is_child() || llama_model_is_hybrid(mdl) || llama_model_is_recurrent(mdl)) {
+            if (task->is_child() || (!keep_hybrid && (llama_model_is_hybrid(mdl) || llama_model_is_recurrent(mdl)))) {
                 prompt_clear();
             }
 
