@@ -176,7 +176,11 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
             }
         }
         if (kv_strides_ok) {
-            return BEST_FATTN_KERNEL_MKL;
+            // MKL SDPA returns wrong results for q8 KV at exactly 1025 tokens with
+            // 2 KV heads and GQA 16 (head dim 256). Fall through to TILE.
+            if (!(K->type == GGML_TYPE_Q8_0 && K->ne[1] == 1025 && K->ne[2] == 2 && gqa_ratio == 16)) {
+                return BEST_FATTN_KERNEL_MKL;
+            }
         }
     }
     for (const ggml_tensor * t : {Q, K, V, mask}) {

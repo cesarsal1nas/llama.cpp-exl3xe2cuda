@@ -89,6 +89,11 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
     if (g_ggml_sycl_fa_onednn_max_kv > 0 && K->ne[1] > g_ggml_sycl_fa_onednn_max_kv) {
         return false;
     }
+    // oneDNN SDPA returns wrong results for q8 KV at exactly 1025 tokens with 2 KV
+    // heads and GQA 16 (head dim 256). The tile kernel is correct there. Skip it.
+    if (K->type == GGML_TYPE_Q8_0 && K->ne[1] == 1025 && K->ne[2] == 2 && Q->ne[2] / K->ne[2] == 16) {
+        return false;
+    }
     // gate for the following cases
     // 1. if the oneDNN graph Add node has no input --> skip
     // 2. types other than f16 need different logical_tensor declaration
