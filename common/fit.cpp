@@ -1,4 +1,5 @@
 #include "fit.h"
+#include <algorithm>
 
 #include "log.h"
 
@@ -1093,10 +1094,14 @@ bool common_memory_overcommit_check(const std::vector<const llama_context *> & c
         devices.push_back(llama_model_get_device(model, i));
     }
     std::vector<size_t> self(devices.size(), 0);
+    std::vector<const llama_model *> counted_models;
     for (const llama_context * ctx : ctxs) {
         if (ctx == nullptr) {
             continue;
         }
+        const llama_model * ctx_model = llama_get_model(ctx);
+        const bool count_model = std::find(counted_models.begin(), counted_models.end(), ctx_model) == counted_models.end();
+        counted_models.push_back(ctx_model);
         for (const auto & buft_mb : llama_get_memory_breakdown(ctx)) {
             ggml_backend_buffer_type_t buft = buft_mb.first;
             if (ggml_backend_buft_is_host(buft)) {
@@ -1105,7 +1110,7 @@ bool common_memory_overcommit_check(const std::vector<const llama_context *> & c
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
             for (size_t i = 0; i < devices.size(); i++) {
                 if (devices[i] == dev) {
-                    self[i] += buft_mb.second.model + buft_mb.second.context + buft_mb.second.compute;
+                    self[i] += (count_model ? buft_mb.second.model : 0) + buft_mb.second.context + buft_mb.second.compute;
                 }
             }
         }
