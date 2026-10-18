@@ -1369,7 +1369,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             }
             {
-                const long pend = llama_lab_get_prompt_end();
+                const long pend = llama_ext_get_prompt_end();
                 if (pend > 0) {
                     // the target hands back no features for big chunks of multi-ubatch prompts
                     if (n_rows_all >= 128 && pend > (long) llama_n_ubatch(ctx_tgt) + 4 &&
@@ -3397,7 +3397,7 @@ common_speculative_init_result::common_speculative_init_result(
         auto cm = cparams;            // separate MTP context with q4_0 draft KV
         cm.type_k = GGML_TYPE_Q4_0;
         cm.type_v = GGML_TYPE_Q4_0;
-        if (const char * e = std::getenv("XE2_LAB_RS_SEQ")) {
+        if (const char * e = std::getenv("LLAMA_RS_SEQ")) {
             cm.n_rs_seq = (uint32_t) atoi(e); // override the separate MTP context's rollback depth
         }
         llama_context * ctx_m = llama_init_from_model(model_tgt, cm);

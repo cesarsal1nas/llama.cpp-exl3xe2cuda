@@ -2512,7 +2512,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size() && !want; ++il) want = cparams.embeddings_layer_inp[il];
             // pipelined prefill slots cannot hand back layer inputs; the drafter's tail ubatches run unpipelined
             static const long tail      = [] { const char * v = getenv("XE2_LAYER_INP_TAIL");   return v ? atol(v) : 0L; }();
-            const long pend = llama_lab_get_prompt_end();
+            const long pend = llama_ext_get_prompt_end();
             const long plast = ubatch.pos ? (long) ubatch.pos[ubatch.n_tokens - 1] : -1;
             if (pend > 0 && plast >= 0) {
                 // multi-ubatch prompts: big chunks stay in the pipelined prefill and hand back no features
@@ -4696,9 +4696,9 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     return ctx->get_embeddings_nextn_ith(i);
 }
 
-static std::atomic<int32_t> g_lab_prompt_end{0};
-void    llama_lab_set_prompt_end(int32_t n) { g_lab_prompt_end.store(n); }
-int32_t llama_lab_get_prompt_end(void)      { return g_lab_prompt_end.load(); }
+static std::atomic<int32_t> g_ext_prompt_end{0};
+void    llama_ext_set_prompt_end(int32_t n) { g_ext_prompt_end.store(n); }
+int32_t llama_ext_get_prompt_end(void)      { return g_ext_prompt_end.load(); }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     ctx->synchronize();

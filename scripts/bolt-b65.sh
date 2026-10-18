@@ -57,7 +57,7 @@ draft=0
 case "$recipe" in
     one)
         devices="${BOLT_DEVICES:-0}"
-        env_list+=("${iq2_env[@]}" XE2_LAB_RS_SEQ=1)
+        env_list+=("${iq2_env[@]}" LLAMA_RS_SEQ=1)
         args+=(--device SYCL0 --split-mode none -c 262144 -b 8192 -ub 8192)
         ;;
     one-draft)

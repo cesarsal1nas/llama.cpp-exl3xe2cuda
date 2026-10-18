@@ -1451,13 +1451,13 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
     // Deep recurrent rollback needs the SYCL conv-concat fusion guard. Mode 2 skips
     // 3..64-token verify batches while preserving fusion for cheap MTP and prefill.
-    // An explicit XE2_LAB_NO_CONV_FUSE in the environment wins.
+    // An explicit GGML_SYCL_CONV_FUSE_SKIP in the environment wins.
     if (params.speculative.need_n_rs_seq() + 1 > 2) {
-        if (std::getenv("XE2_LAB_NO_CONV_FUSE") == nullptr) {
-            common_set_env("XE2_LAB_NO_CONV_FUSE", "2");
+        if (std::getenv("GGML_SYCL_CONV_FUSE_SKIP") == nullptr) {
+            common_set_env("GGML_SYCL_CONV_FUSE_SKIP", "2");
         }
-        const char * v = std::getenv("XE2_LAB_NO_CONV_FUSE");
-        COM_INF("recurrent rollback depth %u: XE2_LAB_NO_CONV_FUSE=%s\n",
+        const char * v = std::getenv("GGML_SYCL_CONV_FUSE_SKIP");
+        COM_INF("recurrent rollback depth %u: GGML_SYCL_CONV_FUSE_SKIP=%s\n",
                 params.speculative.need_n_rs_seq() + 1, v ? v : "?");
     }
 
@@ -1775,7 +1775,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     // Override the per-sequence recurrent rollback depth for this context.
-    if (const char * e = std::getenv("XE2_LAB_RS_SEQ")) {
+    if (const char * e = std::getenv("LLAMA_RS_SEQ")) {
         cparams.n_rs_seq = (uint32_t) atoi(e);
     }
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);

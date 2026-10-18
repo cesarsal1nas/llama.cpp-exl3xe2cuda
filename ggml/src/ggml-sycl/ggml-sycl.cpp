@@ -8091,11 +8091,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 #endif
-        static const int lab_no_conv_fuse = ggml_sycl_get_env("XE2_LAB_NO_CONV_FUSE", 0);
-        // XE2_LAB_NO_CONV_FUSE: 1 = never fuse; 2 = auto, skip only deep-rollback verify batches (DFlash2 block,
+        static const int conv_fuse_skip = ggml_sycl_get_env("GGML_SYCL_CONV_FUSE_SKIP", 0);
+        // GGML_SYCL_CONV_FUSE_SKIP: 1 = never fuse; 2 = auto, skip only deep-rollback verify batches (DFlash2 block,
         // 3..64 tokens: the fused path corrupts it); cheap-MTP verify (<= 2) and prefill keep the fusion
-        bool conv_fuse_off = lab_no_conv_fuse == 1;
-        if (lab_no_conv_fuse == 2 && node->op == GGML_OP_CONCAT && node->src[0] && node->src[1]) {
+        bool conv_fuse_off = conv_fuse_skip == 1;
+        if (conv_fuse_skip == 2 && node->op == GGML_OP_CONCAT && node->src[0] && node->src[1]) {
             const int64_t n_tok = node->ne[0] - node->src[0]->ne[0];
             conv_fuse_off = n_tok > 2 && n_tok <= 64;
         }
