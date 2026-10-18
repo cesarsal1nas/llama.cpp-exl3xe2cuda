@@ -1,5 +1,7 @@
 # llama.cpp-exl3xe2cuda
 
+[Overview](#built-for) | [Qwen3.8 27B card](#card) | [Nemotron 3.5 Bolt](#nemotron-35-bolt) | [Run](#run)
+
 Fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) at `74a7c897f`.
 EXL3 GGUFs on NVIDIA CUDA and Intel Xe2 SYCL. Normal Q/IQ GGUFs on the same
 binaries. Xe2 dGPU (Arc Pro B65 class) gets extra decode speed on those
@@ -64,7 +66,7 @@ llama-server HTTP, not llama-bench.
 
 Stock Q/IQ is a normal GGUF. On a Battlemage dGPU this fork adds Xe2 extras
 (IQ4/Q4 ESIMD GEMV, FA ESIMD, GDN COL2 when n_tokens>=16, fused GDN gate and
-ADD+RMS, faster upload). Leave `GGML_SYCL_*` unset. That is not a new file,
+ADD+RMS, faster upload). Leave `GGML_SYCL_*` unset for these Qwen3.8 cells. That is not a new file,
 and it does not make EXL3 v3 decode fast.
 
 XE2MX4 is a separate quant. One block is 32 weights, 4-bit integer nibbles
@@ -402,6 +404,26 @@ Xe2 profile defaults apply automatically, explicit environment values override
 them. `GGML_SYCL_XE2_PROFILE=0` disables the profile and
 `GGML_SYCL_XE2_LOG=1` enables kernel diagnostics.
 
+## Nemotron 3.5 Bolt
+
+NVIDIA Nemotron 3.5 Bolt 74B-A9B (Mamba2 + attention + MoE) on Arc Pro B65, SYCL only,
+experimental. One card runs a hybrid IQ2_XXS + XE2MX4 file, two cards run an XE2MX4 file
+converted from BF16, with NVIDIA's LiLiCorr drafter optional. Launch with
+`scripts/bolt-b65.sh`; needs oneAPI 2026.1 and the patched oneDNN. GGUFs are not hosted yet.
+
+Release build smoke, llama-server HTTP, 5252-token prompt, reasoning on, q8_0 KV, first request:
+
+| Recipe | Cards | ctx | PP t/s | TG t/s |
+| --- | --- | --- | --- | --- |
+| one | 1 | 262144 | 1520.6 | 36.1 |
+| one-draft | 1 | 262144 | 1168.2 | 37.8 |
+| dual | 2 | 262144 | 2026.2 | 41.0 |
+| dual-draft | 2 | 262144 | 1683.4 | 63.2 |
+| dual-fast | 2 | 16384 | 1747.4 | 65.7 |
+
+Short prompt, short answer; not a sustained card. Sustained lab numbers, models, checksums,
+always-on changes and limits: [docs/nemotron-bolt.md](docs/nemotron-bolt.md).
+
 ## MTP (two modes, same verify)
 
 Both check drafts against the target. Cheap is not a skip-verify path.
@@ -474,7 +496,8 @@ AMD R9700 Q/IQ (not EXL3). `--list-devices` and pick the RADV card:
 ```
 
 Q/IQ GGUFs load on all three binaries. EXL3 only on `build-cuda` and `build-sycl`.
-Leave GGML_SYCL_* unset on B65.
+Leave GGML_SYCL_* unset on B65 for Qwen3.8 and EXL3. Nemotron Bolt is the exception;
+`scripts/bolt-b65.sh` sets its own flags, see [docs/nemotron-bolt.md](docs/nemotron-bolt.md).
 
 ## What we added
 
