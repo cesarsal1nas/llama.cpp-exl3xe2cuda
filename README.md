@@ -413,18 +413,22 @@ converted from BF16, with NVIDIA's LiLiCorr drafter optional. Launch with
 GGUFs: https://huggingface.co/cesarsal1nas/Nemotron-3.5-Bolt-74B-A9B-XE2MX4-GGUF, or rebuild them
 from NVIDIA's files with `scripts/bolt/`.
 
-Release build smoke, llama-server HTTP, 5252-token prompt, reasoning on, q8_0 KV, first request:
+llama-server HTTP, reasoning on, q8_0 KV. Lab-build prompt ladder, warm retrieval request per
+fresh server, not independent-run medians. Context allocation is not prompt length.
 
-| Recipe | Cards | ctx | PP t/s | TG t/s |
-| --- | --- | --- | --- | --- |
-| one | 1 | 262144 | 1520.6 | 36.1 |
-| one-draft | 1 | 262144 | 1168.2 | 37.8 |
-| dual | 2 | 262144 | 2026.2 | 41.0 |
-| dual-draft | 2 | 262144 | 1683.4 | 63.2 |
-| dual-fast | 2 | 16384 | 1747.4 | 65.7 |
+| Setup | Cards | ctx | Actual prompt tokens | PP t/s | TG t/s |
+| --- | --- | --- | --- | --- | --- |
+| Hybrid target | 1, internal | 262144 | 16116 | 2042 | 34.3 |
+| Hybrid + LiLiCorr | 1, internal | 262144 | 16116 | 1489 | 52.2 |
+| XE2MX4 target | 2 | 262144 | 16116 | 2442 | 39.8 |
+| XE2MX4 + LiLiCorr | 2 | 262144 | 16116 | 2170 | 82.6 |
 
-Short prompt, short answer; not a sustained card. Sustained lab numbers, models, checksums,
-always-on changes and limits: [docs/nemotron-bolt.md](docs/nemotron-bolt.md).
+Separate 16384-context fast lab configuration with two B65s and LiLiCorr reached approximately
+2457 PP / 85 TG. Do not mix that cell with the 262144-context ladder above. These are lab
+measurements, not a rerun on the curated release binary.
+
+Full 8k to 240k prompt ladders are on the linked HF card. Release-build smoke checks, sustained
+lab numbers, models, checksums and limits: [docs/nemotron-bolt.md](docs/nemotron-bolt.md).
 
 ## MTP (two modes, same verify)
 
