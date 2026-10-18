@@ -17,7 +17,8 @@ on, for every model:
 ## Models
 
 Two target GGUFs were used. They are different files and the numbers are not interchangeable.
-Neither is hosted yet, and the conversion scripts are not in this repo yet.
+Both, plus the drafter, are at https://huggingface.co/cesarsal1nas/Nemotron-3.5-Bolt-74B-A9B-XE2MX4-GGUF
+and can be rebuilt from NVIDIA's files with `scripts/bolt/` (see Conversion below).
 
 - one card: hybrid file built from NVIDIA's 24GB GGUF. The 80 routed expert tensors stay IQ2_XXS,
   the 160 shared expert and Mamba tensors are requantized to XE2MX4. About 21 GiB.
@@ -42,9 +43,34 @@ Files behind the numbers below:
 
 | File | Bytes | SHA256 |
 | --- | --- | --- |
-| NVIDIA-Nemotron-3.5-Bolt-74B-A9B-ssmshXE2MX4.gguf | 22555066368 | 4cb5e3b65a57887dddce6313e62f823980098f6ead1ddbb215a6441967122020 |
-| Bolt-fromBF16-XE2MX4.gguf | 42708363968 | 2e81379e92574dfce080b125dd2f179e53ae23b82ed4f40d7120c824ce9e9a36 |
-| Bolt-LiLiCorr-XE2MX4-heads.gguf | 1822554496 | 18801d9080f67c86407f8b901c7cb20d6a8a0b31bea00e542fb7fb411ad187f1 |
+| Nemotron-3.5-Bolt-74B-A9B-hybrid-IQ2_XXS-XE2MX4.gguf | 22555066368 | 4cb5e3b65a57887dddce6313e62f823980098f6ead1ddbb215a6441967122020 |
+| Nemotron-3.5-Bolt-74B-A9B-XE2MX4.gguf | 42708363968 | 2e81379e92574dfce080b125dd2f179e53ae23b82ed4f40d7120c824ce9e9a36 |
+| Nemotron-3.5-Bolt-74B-A9B-LiLiCorr-XE2MX4.gguf | 1822554496 | 18801d9080f67c86407f8b901c7cb20d6a8a0b31bea00e542fb7fb411ad187f1 |
+
+## Conversion
+
+Same build tree, `build-sycl/bin/llama-quantize`, one B65 for packing. Each script refuses to
+overwrite its output and checks tensor types, shapes, and that copied tensors are byte-identical.
+
+```
+# one card hybrid, from NVIDIA's 24GB GGUF
+python3 scripts/bolt/hybrid-xe2mx4.py NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf \
+    Nemotron-3.5-Bolt-74B-A9B-hybrid-IQ2_XXS-XE2MX4.gguf
+
+# two card file, from NVIDIA's BF16 checkpoint (BF16 GGUF is about 148 GB)
+python3 scripts/bolt/convert-bf16.py NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16/ \
+    --metadata-from NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf \
+    --outtype bf16 --use-temp-file --outfile Bolt-BF16.gguf
+python3 scripts/bolt/bf16-xe2mx4.py Bolt-BF16.gguf Nemotron-3.5-Bolt-74B-A9B-XE2MX4.gguf
+
+# drafter, from NVIDIA's LiLiCorr GGUF plus the two card file for its embedding and output
+python3 scripts/bolt/drafter-xe2mx4.py NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr.gguf \
+    Nemotron-3.5-Bolt-74B-A9B-XE2MX4.gguf Nemotron-3.5-Bolt-74B-A9B-LiLiCorr-XE2MX4.gguf
+```
+
+`convert-bf16.py` needs the usual `convert_hf_to_gguf.py` Python packages (torch, numpy,
+safetensors). It copies the tokenizer and hyperparameter metadata from NVIDIA's 24GB GGUF so
+both files describe the same model.
 
 ## Build
 

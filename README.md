@@ -409,7 +409,9 @@ them. `GGML_SYCL_XE2_PROFILE=0` disables the profile and
 NVIDIA Nemotron 3.5 Bolt 74B-A9B (Mamba2 + attention + MoE) on Arc Pro B65, SYCL only,
 experimental. One card runs a hybrid IQ2_XXS + XE2MX4 file, two cards run an XE2MX4 file
 converted from BF16, with NVIDIA's LiLiCorr drafter optional. Launch with
-`scripts/bolt-b65.sh`; needs oneAPI 2026.1 and the patched oneDNN. GGUFs are not hosted yet.
+`scripts/bolt-b65.sh`; needs oneAPI 2026.1 and the patched oneDNN.
+GGUFs: https://huggingface.co/cesarsal1nas/Nemotron-3.5-Bolt-74B-A9B-XE2MX4-GGUF, or rebuild them
+from NVIDIA's files with `scripts/bolt/`.
 
 Release build smoke, llama-server HTTP, 5252-token prompt, reasoning on, q8_0 KV, first request:
 
