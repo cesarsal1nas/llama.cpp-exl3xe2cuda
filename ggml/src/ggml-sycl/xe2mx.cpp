@@ -37,6 +37,20 @@
 
 extern int g_ggml_sycl_enable_esimd;
 
+// Activations are cast to f16 for the XMX paths. A value past the f16 range would become inf and then NaN
+// in the dot product (a single outlier in a drafter FFN row did this at M >= 32), so saturate instead.
+static void xe2mx_f32_to_f16_sat(const void * __restrict__ vx, sycl::half * __restrict__ y, int64_t k, dpct::queue_ptr stream) {
+    const float * x = (const float *) vx;
+    stream->parallel_for(sycl::range<1>((size_t) k), [=](sycl::id<1> i) {
+        const float v = x[i];
+        y[i] = sycl::half(sycl::fmin(sycl::fmax(v, -65504.0f), 65504.0f));
+    });
+}
+
+static to_fp16_sycl_t xe2mx_get_to_x(ggml_type type, ggml_tensor * dst) {
+    return type == GGML_TYPE_F32 ? xe2mx_f32_to_f16_sat : ggml_get_to_fp16_sycl(type, dst);
+}
+
 static const char * xe2mx_dump_root(void) {
     const char * e = std::getenv("GGML_SYCL_XE2MX_DUMP_DIR");
     if (e && e[0]) {
@@ -7392,7 +7406,7 @@ static bool xe2mx_p0_dnnl(ggml_backend_sycl_context & ctx,
                && g_xe2mx_xh_hit_epoch == g_xe2mx_xh_epoch) {
         xh = g_xe2mx_xh_buf;
     } else {
-        const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(src1->type, dst);
+        const to_fp16_sycl_t to_x = xe2mx_get_to_x(src1->type, dst);
         GGML_ASSERT(to_x);
         sycl::half * xdst = nullptr;
         if (xcache) {
@@ -7472,7 +7486,7 @@ static bool xe2mx_p0_dnnl(ggml_backend_sycl_context & ctx,
                 if (src1->type == GGML_TYPE_F16) {
                     xh = (const sycl::half *) src1->data;
                 } else {
-                    const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(src1->type, dst);
+                    const to_fp16_sycl_t to_x = xe2mx_get_to_x(src1->type, dst);
                     GGML_ASSERT(to_x);
                     X.alloc((size_t) M * (size_t) K);
                     to_x(src1->data, X.get(), M * K, stream);
@@ -7509,7 +7523,7 @@ static bool xe2mx_p0_dnnl(ggml_backend_sycl_context & ctx,
         if (src1->type == GGML_TYPE_F16) {
             xh = (const sycl::half *) src1->data;
         } else {
-            const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(src1->type, dst);
+            const to_fp16_sycl_t to_x = xe2mx_get_to_x(src1->type, dst);
             GGML_ASSERT(to_x);
             X.alloc((size_t) M * (size_t) K);
             to_x(src1->data, X.get(), M * K, stream);
@@ -8853,7 +8867,7 @@ static bool xe2mx_lo_pack_act(ggml_backend_sycl_context & ctx, const ggml_tensor
                && g_xe2mx_xh_hit_epoch == g_xe2mx_xh_epoch) {
         xh = g_xe2mx_xh_buf;
     } else {
-        const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(act->type, dst);
+        const to_fp16_sycl_t to_x = xe2mx_get_to_x(act->type, dst);
         if (!to_x) {
             return false;
         }
@@ -9054,7 +9068,7 @@ void ggml_sycl_mul_mat_xe2mx(ggml_backend_sycl_context & ctx,
                 if (src1->type == GGML_TYPE_F16) {
                     xhpf = (const sycl::half *) src1->data;
                 } else {
-                    const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(src1->type, dst);
+                    const to_fp16_sycl_t to_x = xe2mx_get_to_x(src1->type, dst);
                     GGML_ASSERT(to_x);
                     Xpf.alloc((size_t) M * (size_t) K);
                     to_x(src1->data, Xpf.get(), M * K, stream);
@@ -9097,7 +9111,7 @@ void ggml_sycl_mul_mat_xe2mx(ggml_backend_sycl_context & ctx,
                 if (src1->type == GGML_TYPE_F16) {
                     xhpf = (const sycl::half *) src1->data;
                 } else {
-                    const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(src1->type, dst);
+                    const to_fp16_sycl_t to_x = xe2mx_get_to_x(src1->type, dst);
                     GGML_ASSERT(to_x);
                     Xpf.alloc((size_t) M * (size_t) K);
                     to_x(src1->data, Xpf.get(), M * K, stream);
@@ -9140,7 +9154,7 @@ void ggml_sycl_mul_mat_xe2mx(ggml_backend_sycl_context & ctx,
                 if (src1->type == GGML_TYPE_F16) {
                     xhpf = (const sycl::half *) src1->data;
                 } else {
-                    const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(src1->type, dst);
+                    const to_fp16_sycl_t to_x = xe2mx_get_to_x(src1->type, dst);
                     GGML_ASSERT(to_x);
                     Xpf.alloc((size_t) M * (size_t) K);
                     to_x(src1->data, Xpf.get(), M * K, stream);
@@ -9183,7 +9197,7 @@ void ggml_sycl_mul_mat_xe2mx(ggml_backend_sycl_context & ctx,
                 if (src1->type == GGML_TYPE_F16) {
                     xhpf = (const sycl::half *) src1->data;
                 } else {
-                    const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(src1->type, dst);
+                    const to_fp16_sycl_t to_x = xe2mx_get_to_x(src1->type, dst);
                     GGML_ASSERT(to_x);
                     Xpf.alloc((size_t) M * (size_t) K);
                     to_x(src1->data, Xpf.get(), M * K, stream);
@@ -9226,7 +9240,7 @@ void ggml_sycl_mul_mat_xe2mx(ggml_backend_sycl_context & ctx,
                 if (src1->type == GGML_TYPE_F16) {
                     xhpf = (const sycl::half *) src1->data;
                 } else {
-                    const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(src1->type, dst);
+                    const to_fp16_sycl_t to_x = xe2mx_get_to_x(src1->type, dst);
                     GGML_ASSERT(to_x);
                     Xpf.alloc((size_t) M * (size_t) K);
                     to_x(src1->data, Xpf.get(), M * K, stream);
@@ -9269,7 +9283,7 @@ void ggml_sycl_mul_mat_xe2mx(ggml_backend_sycl_context & ctx,
                 if (src1->type == GGML_TYPE_F16) {
                     xhpf = (const sycl::half *) src1->data;
                 } else {
-                    const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(src1->type, dst);
+                    const to_fp16_sycl_t to_x = xe2mx_get_to_x(src1->type, dst);
                     GGML_ASSERT(to_x);
                     Xpf.alloc((size_t) M * (size_t) K);
                     to_x(src1->data, Xpf.get(), M * K, stream);
@@ -9312,7 +9326,7 @@ void ggml_sycl_mul_mat_xe2mx(ggml_backend_sycl_context & ctx,
                 if (src1->type == GGML_TYPE_F16) {
                     xhpf = (const sycl::half *) src1->data;
                 } else {
-                    const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(src1->type, dst);
+                    const to_fp16_sycl_t to_x = xe2mx_get_to_x(src1->type, dst);
                     GGML_ASSERT(to_x);
                     Xpf.alloc((size_t) M * (size_t) K);
                     to_x(src1->data, Xpf.get(), M * K, stream);
@@ -9350,7 +9364,7 @@ void ggml_sycl_mul_mat_xe2mx(ggml_backend_sycl_context & ctx,
                        && g_xe2mx_xh_hit_epoch == g_xe2mx_xh_epoch) {
                 xhpf = g_xe2mx_xh_buf;
             } else {
-                const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(src1->type, dst);
+                const to_fp16_sycl_t to_x = xe2mx_get_to_x(src1->type, dst);
                 GGML_ASSERT(to_x);
                 sycl::half * xdst = nullptr;
                 if (xcache) {
@@ -9407,7 +9421,7 @@ void ggml_sycl_mul_mat_xe2mx(ggml_backend_sycl_context & ctx,
                        && g_xe2mx_xh_hit_epoch == g_xe2mx_xh_epoch) {
                 xhpf = g_xe2mx_xh_buf;
             } else {
-                const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(src1->type, dst);
+                const to_fp16_sycl_t to_x = xe2mx_get_to_x(src1->type, dst);
                 GGML_ASSERT(to_x);
                 sycl::half * xdst = nullptr;
                 if (xcache) {
@@ -9468,7 +9482,7 @@ void ggml_sycl_mul_mat_xe2mx(ggml_backend_sycl_context & ctx,
                 if (src1->type == GGML_TYPE_F16) {
                     xhs = (const sycl::half *) src1->data;
                 } else {
-                    const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(src1->type, dst);
+                    const to_fp16_sycl_t to_x = xe2mx_get_to_x(src1->type, dst);
                     GGML_ASSERT(to_x);
                     Xs.alloc((size_t) M * (size_t) K);
                     to_x(src1->data, Xs.get(), M * K, stream);
@@ -9514,7 +9528,7 @@ void ggml_sycl_mul_mat_xe2mx(ggml_backend_sycl_context & ctx,
                 if (src1->type == GGML_TYPE_F16) {
                     xhs = (const sycl::half *) src1->data;
                 } else {
-                    const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(src1->type, dst);
+                    const to_fp16_sycl_t to_x = xe2mx_get_to_x(src1->type, dst);
                     GGML_ASSERT(to_x);
                     Xs.alloc((size_t) M * (size_t) K);
                     to_x(src1->data, Xs.get(), M * K, stream);
@@ -9694,7 +9708,7 @@ void ggml_sycl_mul_mat_xe2mx(ggml_backend_sycl_context & ctx,
         if (src1->type == GGML_TYPE_F16) {
             xh = (const sycl::half *) src1->data;
         } else {
-            const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(src1->type, dst);
+            const to_fp16_sycl_t to_x = xe2mx_get_to_x(src1->type, dst);
             GGML_ASSERT(to_x);
             X.alloc((size_t) M * (size_t) K);
             to_x(src1->data, X.get(), M * K, stream);
@@ -9850,7 +9864,7 @@ void ggml_sycl_mul_mat_xe2mx(ggml_backend_sycl_context & ctx,
         if (src1->type == GGML_TYPE_F16) {
             xh = (const sycl::half *) src1->data;
         } else {
-            const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(src1->type, dst);
+            const to_fp16_sycl_t to_x = xe2mx_get_to_x(src1->type, dst);
             GGML_ASSERT(to_x);
             X.alloc((size_t) M * (size_t) K);
             to_x(src1->data, X.get(), M * K, stream);
@@ -11038,7 +11052,7 @@ int ggml_sycl_xe2mx_s4ovl_run(ggml_backend_sycl_context & ctx, ggml_cgraph * cgr
             g_xe2mx_xh_buf = (sycl::half *) p;
             g_xe2mx_xh_cap = need;
         }
-        const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(act->type, nodes[0]);
+        const to_fp16_sycl_t to_x = xe2mx_get_to_x(act->type, nodes[0]);
         if (!to_x) {
             return 0;
         }
@@ -11890,7 +11904,7 @@ bool ggml_sycl_xe2mx_mul_mat_glu(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             } else if (glu_lo && act->type == GGML_TYPE_F32 && ggml_is_contiguous(act)) {
                 xf_act = (const float *) act->data;
             } else {
-                const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(act->type, glu);
+                const to_fp16_sycl_t to_x = xe2mx_get_to_x(act->type, glu);
                 if (to_x) {
                     sycl::half * xdst = nullptr;
                     if (xcache) {
@@ -12066,7 +12080,7 @@ bool ggml_sycl_xe2mx_mul_mat_glu(ggml_backend_sycl_context & ctx, ggml_cgraph * 
                && g_xe2mx_xh_hit_epoch == g_xe2mx_xh_epoch) {
         xh = g_xe2mx_xh_buf;
     } else {
-        const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(act->type, glu);
+        const to_fp16_sycl_t to_x = xe2mx_get_to_x(act->type, glu);
         if (!to_x) {
             return false;
         }
@@ -12240,7 +12254,7 @@ int ggml_sycl_xe2mx_s4gmlp_run(ggml_backend_sycl_context & ctx, ggml_cgraph * cg
                && g_xe2mx_xh_hit_epoch == g_xe2mx_xh_epoch) {
         xh = g_xe2mx_xh_buf;
     } else {
-        const to_fp16_sycl_t to_x = ggml_get_to_fp16_sycl(act->type, down);
+        const to_fp16_sycl_t to_x = xe2mx_get_to_x(act->type, down);
         if (!to_x) {
             return 0;
         }

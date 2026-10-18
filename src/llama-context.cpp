@@ -1010,6 +1010,23 @@ float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
 
     GGML_ASSERT(lid < embd_layer_inp.size() && embd_layer_inp[lid].has_data());
 
+    if (!layer_inp_perm.empty()) {
+        // rows were written per ubatch; the caller indexes them by batch position
+        synchronize();
+        const size_t n_embd = model.hparams.n_embd;
+        const size_t n_rows = layer_inp_perm.size();
+        std::vector<float> tmp(n_rows * n_embd);
+        for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
+            if (!embd_layer_inp[il].has_data() || embd_layer_inp[il].size < n_rows * n_embd) continue;
+            float * d = embd_layer_inp[il].data;
+            std::memcpy(tmp.data(), d, n_rows * n_embd * sizeof(float));
+            for (size_t r = 0; r < n_rows; ++r) {
+                std::memcpy(d + (size_t) layer_inp_perm[r] * n_embd, tmp.data() + r * n_embd, n_embd * sizeof(float));
+            }
+        }
+        layer_inp_perm.clear();
+    }
+
     return embd_layer_inp[lid].data;
 }
 
@@ -2389,6 +2406,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
     {
         static const long tail = [] { const char * v = std::getenv("XE2_LAYER_INP_TAIL"); return v ? std::atol(v) : 0L; }();
         layer_inp_keep_from = (tail > 0 && (long) n_tokens_all > tail) ? (size_t) (n_tokens_all - tail) : 0;
+        // the tail/prompt-end skips assume one sequence; with several, every row is needed
+        layer_inp_multi_seq = false;
+        for (int32_t i = 1; i < batch_inp.n_tokens && batch_inp.seq_id && batch_inp.n_seq_id; ++i) {
+            if (batch_inp.seq_id[i][0] != batch_inp.seq_id[0][0]) { layer_inp_multi_seq = true; break; }
+        }
+        if (layer_inp_multi_seq) layer_inp_keep_from = 0;
+        layer_inp_perm.clear();
     }
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
@@ -2512,7 +2536,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size() && !want; ++il) want = cparams.embeddings_layer_inp[il];
             // pipelined prefill slots cannot hand back layer inputs; the drafter's tail ubatches run unpipelined
             static const long tail      = [] { const char * v = getenv("XE2_LAYER_INP_TAIL");   return v ? atol(v) : 0L; }();
-            const long pend = llama_ext_get_prompt_end();
+            const long pend = ubatch.n_seqs_unq == 1 ? llama_ext_get_seq_prompt_end(ubatch.seq_id_unq[0]) : 0;
             const long plast = ubatch.pos ? (long) ubatch.pos[ubatch.n_tokens - 1] : -1;
             if (pend > 0 && plast >= 0) {
                 // multi-ubatch prompts: big chunks stay in the pipelined prefill and hand back no features
@@ -2525,6 +2549,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
             } else {
                 ubatch_wants_layer_inp = want;
                 ubatch_needs_layer_inp = want && (size_t) (n_tokens_prev + ubatch.n_tokens) > layer_inp_keep_from;
+            }
+            if (layer_inp_multi_seq) {
+                bool any = false;
+                for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size() && !any; ++il) any = cparams.embeddings_layer_inp[il];
+                ubatch_wants_layer_inp = any;
+                ubatch_needs_layer_inp = any;
             }
         }
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
@@ -2707,6 +2737,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
+
+    {
+        bool any = false;
+        for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size() && !any; ++il) any = cparams.embeddings_layer_inp[il];
+        const auto & tok_ids = balloc->get_tok_ids();
+        if (any && tok_ids.size() == n_tokens_all) {
+            for (size_t r = 0; r < tok_ids.size(); ++r) {
+                if (tok_ids[r] != (int32_t) r) { layer_inp_perm = tok_ids; break; }
+            }
+        }
+    }
 
     // set output mappings
     if (n_outputs > 0) {
@@ -2964,7 +3005,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 
 void llama_context::output_reorder() {
     const uint64_t n_vocab     = model.vocab.n_tokens();
-    const uint64_t n_embd      = model.hparams.n_embd;
+    const uint64_t n_embd      = model.hparams.n_embd; (void) n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();
 
     for (size_t s = 0; s < output_swaps.size(); ++s) {
@@ -2989,15 +3030,6 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (embd_layer_inp.size() > 0) {
-            for (int lid = 0; lid < (int) embd_layer_inp.size(); ++lid) {
-                if (embd_layer_inp[lid].size > 0) {
-                    for (uint64_t k = 0; k < n_embd; ++k) {
-                        std::swap(embd_layer_inp[lid].data[i0*n_embd + k], embd_layer_inp[lid].data[i1*n_embd + k]);
-                    }
-                }
-            }
-        }
 
         if (!sampling.samplers.empty()) {
             assert(sampling.logits.size > 0);
@@ -4696,9 +4728,15 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     return ctx->get_embeddings_nextn_ith(i);
 }
 
-static std::atomic<int32_t> g_ext_prompt_end{0};
-void    llama_ext_set_prompt_end(int32_t n) { g_ext_prompt_end.store(n); }
-int32_t llama_ext_get_prompt_end(void)      { return g_ext_prompt_end.load(); }
+static std::atomic<int32_t> g_ext_prompt_end[LLAMA_MAX_SEQ] = {};
+void    llama_ext_set_prompt_end(int32_t n) { for (auto & v : g_ext_prompt_end) v.store(n); }
+int32_t llama_ext_get_prompt_end(void)      { return g_ext_prompt_end[0].load(); }
+void    llama_ext_set_seq_prompt_end(int32_t seq_id, int32_t n) {
+    if (seq_id >= 0 && seq_id < LLAMA_MAX_SEQ) g_ext_prompt_end[seq_id].store(n);
+}
+int32_t llama_ext_get_seq_prompt_end(int32_t seq_id) {
+    return seq_id >= 0 && seq_id < LLAMA_MAX_SEQ ? g_ext_prompt_end[seq_id].load() : 0;
+}
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     ctx->synchronize();

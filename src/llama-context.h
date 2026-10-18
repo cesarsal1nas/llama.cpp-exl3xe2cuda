@@ -244,6 +244,8 @@ private:
     std::vector<layer_inp_pending_t> layer_inp_pending; // pipelined prefill reads deferred to batch end
     bool ubatch_needs_layer_inp = false;
     bool ubatch_wants_layer_inp = true; // lab: false for sequences routed away from the drafter
+    std::vector<int32_t> layer_inp_perm; // non-empty: rows are in ubatch order, move to batch order on read
+    bool layer_inp_multi_seq = false;
     size_t layer_inp_keep_from = 0; // lab: rows of the current batch before this index are not copied out
 
     //

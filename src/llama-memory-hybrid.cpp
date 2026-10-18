@@ -87,9 +87,10 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                // lab: prefill writes at most llama_rs_prefill_k snapshots, so the tail that must stay
-                // together is that count, not n_rs_seq+1 (depth 8 cut every ubatch to 3064 and cost long PP)
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? (uint32_t) llama_rs_prefill_k(n_rs_seq + 1) : 0);
+                // split_equal relaxes this to 2 for seqs longer than 64 tokens (prefill writes at most
+                //   llama_rs_prefill_k snapshots), so long PP is not cut while speculative verify blocks
+                //   of concurrent slots keep their whole rollback tail
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {

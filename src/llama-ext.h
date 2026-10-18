@@ -117,9 +117,12 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
-// lab (single slot): absolute prompt length of the request being prefilled; 0 = unknown
+// absolute prompt length of the request being prefilled; 0 = unknown
+// the seq-less pair applies to every sequence (single slot); servers with several slots use the _seq pair
 LLAMA_API void    llama_ext_set_prompt_end(int32_t n);
 LLAMA_API int32_t llama_ext_get_prompt_end(void);
+LLAMA_API void    llama_ext_set_seq_prompt_end(int32_t seq_id, int32_t n);
+LLAMA_API int32_t llama_ext_get_seq_prompt_end(int32_t seq_id);
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 

@@ -466,6 +466,7 @@ llama_pos llama_batch_allocr::seq_pos_max(llama_seq_id seq_id) const {
 
 void llama_batch_allocr::split_reset() {
     out_ids.clear();
+    tok_ids.clear();
 
     n_used = 0;
 
@@ -612,12 +613,18 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             return (uint32_t) (seq_set_map[cur_seq_set[s]].size() - cur_idx[s]);
         };
 
+        // long prompts only write the last 2 recurrent snapshots, so only that tail must stay together;
+        //   short decode/verify blocks (speculative drafts) need the full rollback tail in one ubatch
+        auto keep_tail = [&](uint32_t s) {
+            return seq_set_map[cur_seq_set[s]].size() > 64 ? std::min<uint32_t>(n_keep_tail, 2) : n_keep_tail;
+        };
+
         // keep the longest prefix of seqs that satisfy the constraint, to preserve sequential seq ids
         uint32_t n_keep = 0;
         while (n_keep < n_seqs) {
             const uint32_t remaining = n_remaining(n_keep);
 
-            if (remaining != 0 && remaining < n_keep_tail) {
+            if (remaining != 0 && remaining < keep_tail(n_keep)) {
                 break;
             }
 
@@ -644,7 +651,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
                 }
             } else {
                 // truncate the seq so that at least n_keep_tail tokens remain
-                while (n_remaining(0) < n_keep_tail) {
+                while (n_remaining(0) < keep_tail(0)) {
                     used[idxs.back()] = false;
                     --n_used;
 
@@ -800,6 +807,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         if (udata->output[i]) {
             out_ids.push_back(idxs[i]);
         }
+        tok_ids.push_back(idxs[i]);
     }
 
     llama_seq_id * seq_id_ptr = udata->seq_id_data.data();

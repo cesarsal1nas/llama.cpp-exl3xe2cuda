@@ -14,7 +14,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
-void llama_ext_set_prompt_end(int32_t n); // src/llama-ext.h (C++ linkage)
+void llama_ext_set_seq_prompt_end(int32_t seq_id, int32_t n); // src/llama-ext.h (C++ linkage)
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -3149,7 +3149,7 @@ private:
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
-                        llama_ext_set_prompt_end((int32_t) slot.task->n_tokens()); // drafter feature tail by prompt length
+                        llama_ext_set_seq_prompt_end(slot.id, (int32_t) slot.task->n_tokens()); // drafter feature tail by prompt length
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 

@@ -1369,7 +1369,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             }
             {
-                const long pend = llama_ext_get_prompt_end();
+                const long pend = llama_ext_get_seq_prompt_end(seq_id);
                 if (pend > 0) {
                     // the target hands back no features for big chunks of multi-ubatch prompts
                     if (n_rows_all >= 128 && pend > (long) llama_n_ubatch(ctx_tgt) + 4 &&
@@ -1387,6 +1387,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             i_batch_beg[seq_id] += skip;
             const int32_t n_rows = n_rows_all - skip;
+
+            // a reused slot keeps its old draft rows; when the tail skip leaves a gap after them the
+            // positions are no longer consecutive and the decode is refused, so start the seq over
+            {
+                auto * mem_dft = llama_get_memory(ctx_dft);
+                const llama_pos p_first = batch_in.pos[i_batch_beg[seq_id]];
+                const llama_pos p_max   = llama_memory_seq_pos_max(mem_dft, seq_id);
+                if (p_max >= 0 && p_first > p_max + 1) {
+                    llama_memory_seq_rm(mem_dft, seq_id, -1, -1);
+                }
+            }
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
