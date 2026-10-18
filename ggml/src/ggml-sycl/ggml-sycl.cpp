@@ -6307,7 +6307,7 @@ static void ggml_sycl_mul_mat_id_xe2mx_prefill(ggml_backend_sycl_context & ctx, 
                 for (int t = 0; t < 16; ++t) {
                     dp[t] = dtile[t];
                 }
-                // W8[k][n0:n0+16] for k in ib*32.. — contiguous 16-byte stores
+                // W8[k][n0:n0+16] for k in ib*32.., contiguous 16-byte stores
                 int8_t * wp0 = W8 + ((size_t) e * (size_t) K + (size_t) ib * 32) * (size_t) N + (size_t) n0;
 #pragma unroll
                 for (int j = 0; j < 32; ++j) {

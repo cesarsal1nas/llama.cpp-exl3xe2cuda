@@ -1453,11 +1453,12 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     // 3..64-token verify batches while preserving fusion for cheap MTP and prefill.
     // An explicit XE2_LAB_NO_CONV_FUSE in the environment wins.
     if (params.speculative.need_n_rs_seq() + 1 > 2) {
-        if (setenv("XE2_LAB_NO_CONV_FUSE", "2", 0) == 0) {
-            const char * v = std::getenv("XE2_LAB_NO_CONV_FUSE");
-            COM_INF("recurrent rollback depth %u: XE2_LAB_NO_CONV_FUSE=%s\n",
-                    params.speculative.need_n_rs_seq() + 1, v ? v : "?");
+        if (std::getenv("XE2_LAB_NO_CONV_FUSE") == nullptr) {
+            common_set_env("XE2_LAB_NO_CONV_FUSE", "2");
         }
+        const char * v = std::getenv("XE2_LAB_NO_CONV_FUSE");
+        COM_INF("recurrent rollback depth %u: XE2_LAB_NO_CONV_FUSE=%s\n",
+                params.speculative.need_n_rs_seq() + 1, v ? v : "?");
     }
 
     common_init_result_ptr res(new common_init_result(params, model_only));

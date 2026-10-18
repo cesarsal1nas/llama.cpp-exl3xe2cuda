@@ -66,6 +66,6 @@ static int ggml_sycl_try_bolt_tail(ggml_backend_sycl_context & ctx, ggml_cgraph 
         }
     });
     static int logged = 0;
-    if (logged++ < 8) fprintf(stderr, "bolt tail fused grouped RMS, tokens=%ld\n", long(out->ne[2]));
+    if (logged++ < 8) GGML_SYCL_XE2_LOG("bolt tail fused grouped RMS, tokens=%ld\n", long(out->ne[2]));
     return 8;
 }

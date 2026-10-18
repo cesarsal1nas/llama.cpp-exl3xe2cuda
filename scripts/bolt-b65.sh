@@ -22,7 +22,7 @@
 set -euo pipefail
 
 recipe="${1:-}"
-[ -n "$recipe" ] || { sed -n '2,20p' "$0"; exit 1; }
+[ -n "$recipe" ] || { sed -n '2,21p' "$0"; exit 1; }
 shift
 
 : "${BOLT_MODEL:?set BOLT_MODEL to the target GGUF}"

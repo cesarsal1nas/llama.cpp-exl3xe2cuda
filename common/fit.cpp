@@ -1113,6 +1113,9 @@ bool common_memory_overcommit_check(const std::vector<const llama_context *> & c
     constexpr int64_t MiB = 1024 * 1024;
     // driver, kernel binaries and library scratch live outside these buffers (measured ~2-3 GiB on Arc B65)
     constexpr int64_t warn_headroom = 3 * 1024 * MiB;
+    // unified memory setups can legitimately exceed device total; LLAMA_ALLOW_OVERCOMMIT=1 turns the refusal into a warning
+    const char * allow_env = std::getenv("LLAMA_ALLOW_OVERCOMMIT");
+    const bool allow = allow_env != nullptr && std::atoi(allow_env) != 0;
     bool ok = true;
     for (size_t i = 0; i < devices.size(); i++) {
         size_t free = 0, total = 0;
@@ -1121,7 +1124,11 @@ bool common_memory_overcommit_check(const std::vector<const llama_context *> & c
             continue;
         }
         const int64_t headroom = (int64_t) total - (int64_t) self[i];
-        if (headroom < 0) {
+        if (headroom < 0 && allow) {
+            LOG_WRN("%s: %s needs %" PRId64 " MiB of buffers but has %" PRId64 " MiB total; continuing because "
+                    "LLAMA_ALLOW_OVERCOMMIT is set\n", __func__, ggml_backend_dev_name(devices[i]),
+                    (int64_t) self[i] / MiB, (int64_t) total / MiB);
+        } else if (headroom < 0) {
             LOG_ERR("%s: %s needs %" PRId64 " MiB of buffers but has %" PRId64 " MiB total; reduce -ub/-b, "
                     "context size, or rebalance --tensor-split/draft device\n", __func__, ggml_backend_dev_name(devices[i]),
                     (int64_t) self[i] / MiB, (int64_t) total / MiB);
