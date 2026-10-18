@@ -139,6 +139,11 @@ The difference is inside the run to run spread of the baseline path. This is one
 general accuracy claim. Outputs are not bit reproducible between launches even at temperature 0,
 with or without these kernels, so other runs of the same slice land on slightly different values.
 
+Against NVIDIA's own 24GB GGUF on the same slice (6.3988): the one card hybrid is 4.2 percent
+higher, because its 160 shared expert and Mamba tensors were already quantized (IQ2_XXS, NVFP4)
+and get quantized a second time into XE2MX4. The two card file is 10.2 percent lower, quantized once
+from BF16.
+
 ## Results
 
 ### Clean release candidate checks
@@ -193,7 +198,9 @@ workloads and should not be compared as regressions.
 ## Limits
 
 - Arc Pro B65 only. Other Xe2 parts and other systems are untested.
-- The test box has one B65 on a chipset PCIe 4.0 x4 link and one in a Thunderbolt 3 dock; the
-  dock card is 5 to 8 percent slower on prefill. Two card numbers are capped by the slower card.
+- The B65 is a PCIe 5.0 x16 card; on the test box one runs in a chipset slot at PCIe 4.0 x4 and
+  the other in a Thunderbolt 3 dock at PCIe 3.0 x4. The dock card is 5 to 8 percent slower on
+  prefill and two card numbers are capped by the slower card, so wider or faster links will likely
+  do better. Not measured here.
 - No peer to peer between the cards; the layer split boundary goes through host memory.
 - 262144 context with `-ub 8192` on two cards does not fit; the memory check refuses it.
